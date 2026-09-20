@@ -1,8 +1,8 @@
 """
-StudyGenie by Sparsh Singhal
+SaarthiBhai by Sparsh Singhal
 Fully Gamified Multi-Platform E-Learning Bot
 Telegram + WhatsApp + Web Dashboard
-Groq (Primary) + Gemini (Fallback) | All Exams | Stats | Razorpay Pro
+Gemini (Primary) + OpenRouter (Fallback) | All Exams | Stats | Razorpay Pro
 UI: Branding + Pro Modal + Sounds + Dev Mode + Name Input + Markdown Render
 """
 
@@ -60,7 +60,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("studygenie")
+logger = logging.getLogger("saarthibhai")
 
 
 class Config:
@@ -94,7 +94,7 @@ class Config:
             ).split(",") if m.strip()
         ]
         self.OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "https://studygenie.app").strip()
-        self.OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "StudyGenie by Sparsh Singhal").strip()
+        self.OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "SaarthiBhai by Sparsh Singhal").strip()
 
         self.FREE_DAILY = int(os.getenv("FREE_DAILY_QUESTIONS", "4"))
         self.FREE_LIFETIME = int(os.getenv("FREE_LIFETIME_QUESTIONS", "12"))
@@ -915,10 +915,10 @@ _redis_for_rl = db.redis
 
 SOFT_FAIL_MSG = (
     "🎯 Target almost locked!\n\n"
-    "StudyGenie abhi thoda busy hai (free AI limits).\n"
+    "SaarthiBhai abhi thoda busy hai (free AI limits).\n"
     "15–20 second baad dubara try karo — answers wapas aa jaate hain.\n\n"
     "Short tip: chhota clear sawaal likho.\n"
-    "- Sparsh Singhal ka StudyGenie tumhare saath hai"
+    "- Sparsh Singhal ka SaarthiBhai tumhare saath hai"
 )
 
 class AIService:
@@ -943,7 +943,7 @@ class AIService:
 
     def _base_prompt(self, is_pro: bool) -> str:
         base = (
-            "You are StudyGenie by Sparsh Singhal – India's fun gamified AI tutor for Class 6-12, "
+            "You are SaarthiBhai by Sparsh Singhal – India's fun gamified AI tutor for Class 6-12, "
             "JEE, NEET, GATE, UPSC, SSC, Banking, CA, CUET, Olympiads, School Exams, College Exams, and many more. Reply in natural Hinglish. "
             "Be clear, exam-oriented, encouraging, use emojis. Keep answers concise (prefer under ~250 words unless user asks for detail). "
             "Use clean Markdown: headings, bold, bullet lists, and simple tables when helpful. ""For math use LaTeX in \\( ... \\) or $$ ... $$. Also add one plain-English line under hard formulas.\n\n"
@@ -1102,7 +1102,7 @@ class AIService:
             resp = self.groq_client.chat.completions.create(
                 model=config.GROQ_MODEL,
                 messages=[
-                    {"role": "system", "content": "You are StudyGenie. Reply in Hinglish. Use clean Markdown."},
+                    {"role": "system", "content": "You are SaarthiBhai. Reply in Hinglish. Use clean Markdown."},
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.7,
@@ -1148,7 +1148,7 @@ class AIService:
             payload = {
                 "model": model,
                 "messages": [
-                    {"role": "system", "content": "You are StudyGenie. Reply in Hinglish. Use clean Markdown."},
+                    {"role": "system", "content": "You are SaarthiBhai. Reply in Hinglish. Use clean Markdown."},
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": 0.7,
@@ -1465,7 +1465,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db.track_activity(user.id)
     bonus_note = "\n\n🎁 Referral bonus applied!" if ref_code else ""
     await reply(update,
-                f"🎓 *Welcome to StudyGenie!*\n\nHi {user.first_name}! Type your doubt or use menu.{bonus_note}\n\n_ - made with love by Sparsh Singhal _",
+                f"🎓 *Welcome to SaarthiBhai!*\n\nHi {user.first_name}! Type your doubt or use menu.{bonus_note}\n\n_ - made with love by Sparsh Singhal _",
                 main_menu(db.is_pro(user.id)))
 
 
@@ -1526,13 +1526,13 @@ async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     domain = config.VERCEL_URL.rstrip("/") if config.VERCEL_URL else "studygenie-by-sparsh-singhal.onrender.com"
     link = f"https://{domain}/pay?uid={uid}"
     await reply(update,
-                f"💎 *StudyGenie Pro – ₹{config.PRO_PRICE_INR}/30 days*\n\n"
+                f"💎 *SaarthiBhai Pro – ₹{config.PRO_PRICE_INR}/30 days*\n\n"
                 "Unlimited • Roast • Mindmap • OCR • 2× XP\n\n"
                 f"Pay here: {link}\n\n_ - made with love by Sparsh Singhal _")
 
 
 async def about_sparsh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await reply(update, "👨‍💻 *Sparsh Singhal*\n\nCreator & Developer of StudyGenie 🎓\nBuilt with ❤️ for Indian students — gamified learning for every exam.\n\n_StudyGenie — by Sparsh Singhal_")
+    await reply(update, "👨‍💻 *Sparsh Singhal*\n\nCreator & Developer of SaarthiBhai 🎓\nBuilt with ❤️ for Indian students — gamified learning for every exam.\n\n_SaarthiBhai — by Sparsh Singhal_")
 
 
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1653,7 +1653,7 @@ def process_whatsapp_message(from_number: str, text: str, profile_name: str = ""
     is_pro = db.is_pro(uid)
     tool = detect_tool_from_text(text)
     if tool in PRO_ONLY_TOOLS and not is_pro:
-        _send_whatsapp_text(from_number, f"🔒 Pro-only tool.\n\nUpgrade ₹{config.PRO_PRICE_INR}/30 days — StudyGenie by Sparsh Singhal.")
+        _send_whatsapp_text(from_number, f"🔒 Pro-only tool.\n\nUpgrade ₹{config.PRO_PRICE_INR}/30 days — SaarthiBhai by Sparsh Singhal.")
         return
     if not is_pro:
         can, quota = db.try_consume_quota(uid)
@@ -1704,8 +1704,8 @@ FRONTEND_HTML = r"""
 <link rel="apple-touch-icon" href="/bot-icon.svg">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>StudyGenie by Sparsh Singhal</title>
-<meta name="description" content="StudyGenie — India's gamified AI tutor, built by Sparsh Singhal.">
+<title>SaarthiBhai by Sparsh Singhal</title>
+<meta name="description" content="SaarthiBhai — India's gamified AI tutor, built by Sparsh Singhal.">
 <style>
 :root{--bg:#0b1220;--card:#111827;--accent:#22d3ee;--text:#f1f5f9;--muted:#94a3b8;--border:rgba(255,255,255,0.08)}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -1809,8 +1809,8 @@ footer.brand-footer strong{color:var(--accent)}
 </head>
 <body>
 <header>
-  <div class="logo-wrap" id="logoClick" title="StudyGenie">
-    <img src="/bot-icon.svg" alt="StudyGenie" width="52" height="52" onerror="this.src='/sparsh.jpg'">
+  <div class="logo-wrap" id="logoClick" title="SaarthiBhai">
+    <img src="/bot-icon.svg" alt="SaarthiBhai" width="52" height="52" onerror="this.src='/sparsh.jpg'">
     <div>
       <div class="logo">Study<span>Genie</span></div>
       <div class="brand-sub">by Sparsh Singhal</div>
@@ -1830,7 +1830,7 @@ footer.brand-footer strong{color:var(--accent)}
       <img src="/sparsh.jpg" alt="Sparsh Singhal" onerror="this.style.display='none'">
       <div>
         <div class="name">Sparsh Singhal</div>
-        <div class="role">Creator of StudyGenie</div>
+        <div class="role">Creator of SaarthiBhai</div>
       </div>
     </div>
     <h3>Tools</h3>
@@ -1863,7 +1863,7 @@ footer.brand-footer strong{color:var(--accent)}
     <div class="messages" id="messages">
       <div class="welcome">
         <img src="/sparsh.jpg" alt="Sparsh Singhal" onerror="this.style.display='none'" style="width:132px;height:132px;border-radius:50%;object-fit:cover;border:3px solid #22d3ee;box-shadow:0 0 0 6px rgba(34,211,238,.22);margin-bottom:.85rem">
-        <h2>Welcome to StudyGenie 🎓</h2>
+        <h2>Welcome to SaarthiBhai 🎓</h2>
         <p>Built with ❤️ by <strong>Sparsh Singhal</strong></p>
         <p style="margin-top:.75rem;font-size:.9rem">All exams • Free tools + Pro power</p>
       </div>
@@ -1911,7 +1911,7 @@ footer.brand-footer strong{color:var(--accent)}
     </div>
   </section>
 </main>
-<footer class="brand-footer">🎓 StudyGenie — built with ❤️ by <strong>Sparsh Singhal</strong></footer>
+<footer class="brand-footer">🎓 SaarthiBhai — built with ❤️ by <strong>Sparsh Singhal</strong></footer>
 
 
 <div class="modal-bg" id="proOnlyModal" onclick="if(event.target===this)closeProOnlyModal()">
@@ -2609,7 +2609,7 @@ async function ask(){
   document.getElementById("question").value = "";
   const loading = document.createElement("div");
   loading.className = "msg bot loading";
-  loading.textContent = "🎯 Target locked by Sparsh Singhal's StudyGenie...";
+  loading.textContent = "🎯 Target locked by Sparsh Singhal's SaarthiBhai...";
   document.getElementById("messages").appendChild(loading);
   try{
     const res = await fetch("/api/webask", {
@@ -2696,7 +2696,7 @@ PAY_HTML = r"""
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Upgrade Pro – StudyGenie by Sparsh Singhal</title>
+<title>Upgrade Pro – SaarthiBhai by Sparsh Singhal</title>
 <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
 <style>
 body{font-family:system-ui,sans-serif;background:#0b1220;color:#f1f5f9;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}
@@ -2714,7 +2714,7 @@ a{color:#22d3ee}
 </head>
 <body>
 <div class="card">
-  <h1>🎓 StudyGenie Pro</h1>
+  <h1>🎓 SaarthiBhai Pro</h1>
   <p>Doubt yahin mat rokna — unlimited access for 30 days</p>
   <div class="price">₹{{ price }} <span style="font-size:1rem;color:#94a3b8">/ 30 days</span></div>
   <ul>
@@ -2725,7 +2725,7 @@ a{color:#22d3ee}
   </ul>
   <button id="payBtn" onclick="startPay()">Pay ₹{{ price }} Securely</button>
   <p class="msg" id="status">User: {{ uid }}</p>
-  <p class="msg"><a href="/">← Back to StudyGenie</a></p>
+  <p class="msg"><a href="/">← Back to SaarthiBhai</a></p>
   <div class="creator"><img src="/sparsh.jpg" alt="Sparsh Singhal" onerror="this.style.display='none'"> Built by Sparsh Singhal</div>
 </div>
 <script>
@@ -2740,7 +2740,7 @@ async function startPay(){
     const data=await res.json();
     if(data.error){status.textContent="Error: "+data.error;btn.disabled=false;return;}
     const rzp=new Razorpay({
-      key:KEY_ID,amount:data.amount,currency:"INR",name:"StudyGenie Pro",
+      key:KEY_ID,amount:data.amount,currency:"INR",name:"SaarthiBhai Pro",
       description:"30 days Pro",order_id:data.id,notes:{user_id:UID},
       handler:async function(response){
         status.textContent="✅ Payment received. Unlocking Pro...";
@@ -2790,7 +2790,7 @@ app = Flask(__name__)
 
 @app.route("/bot-icon.svg")
 def bot_icon():
-    """StudyGenie avatar — clean genie + book mark for the bot name."""
+    """SaarthiBhai avatar — clean genie + book mark for the bot name."""
     svg = """<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
   <defs>
@@ -3040,7 +3040,7 @@ def health():
             "gemini_flash_lite": ai.gemini_client is not None,
             "openrouter": ai.openrouter_ready,
         },
-        "version": "StudyGenie v6.11 (Better StudyGenie icon + faster answers)",
+        "version": "SaarthiBhai v6.12 (Rename to SaarthiBhai)",
         "creator": "Sparsh Singhal",
     })
 
@@ -3057,7 +3057,7 @@ def debug_ai():
             "openrouter": bool(config.OPENROUTER_API_KEY),
         },
     }
-    test_prompt = "Say exactly: OK StudyGenie"
+    test_prompt = "Say exactly: OK SaarthiBhai"
 
     def _timed(fn, *a, **kw):
         t0 = time.time()
@@ -3114,7 +3114,7 @@ def web_ask():
     if not is_pro:
         can, quota = db.try_consume_quota(uid)
         if not can:
-            return jsonify({"answer": "❌ Free limit khatam\n\nDoubt yahin ruk gaya. Kal tak wait — chahe raat ko exam ho.\n\nPro = ₹%s / 30 din (din ka ~₹1.6)\nUnlimited + photo se sawaal + mock/PYQ\n\nLimit pe mat atakna.\n\n- StudyGenie by Sparsh Singhal" % config.PRO_PRICE_INR, "quota": quota, "upsell": True})
+            return jsonify({"answer": "❌ Free limit khatam\n\nDoubt yahin ruk gaya. Kal tak wait — chahe raat ko exam ho.\n\nPro = ₹%s / 30 din (din ka ~₹1.6)\nUnlimited + photo se sawaal + mock/PYQ\n\nLimit pe mat atakna.\n\n- SaarthiBhai by Sparsh Singhal" % config.PRO_PRICE_INR, "quota": quota, "upsell": True})
     start = time.time()
     cached = False
     answer = None
@@ -3144,7 +3144,7 @@ def web_ask():
         return jsonify({
             "answer": (
                 "🎯 Target almost locked!\n\n"
-                "StudyGenie abhi thoda busy hai (free servers pe heavy traffic).\n"
+                "SaarthiBhai abhi thoda busy hai (free servers pe heavy traffic).\n"
                 "15–20 second baad dubara **Fire** dabao — zyada tar sawaal tab clear ho jaate hain.\n\n"
                 "Tip: simple / short sawaal try karo, ya thodi der baad.\n"
                 "Pro plan = unlimited + priority.\n\n"
