@@ -2,9 +2,9 @@
 
 AI Study Buddy — Made with ❤️ by Sparsh Singhal
 
-Gamified AI tutor for Class 9–12, JEE, NEET, and more.
+Gamified AI tutor for Class 9–12, JEE, NEET, and many more.
 
-**Live:** https://studygenie-by-sparsh-singhal.onrender.com
+**Live:** https://saarthibhai-by-sparsh-singhal.onrender.com
 
 ## Features
 - Free + Pro plans (Razorpay)
