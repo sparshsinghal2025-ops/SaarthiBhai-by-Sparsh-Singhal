@@ -1,0 +1,539 @@
+{
+  "app": {
+    "brand_name": "SaarthiBhai by Sparsh Singhal",
+    "creator_name": "Sparsh Singhal",
+    "creator_photo_url": "/sparsh.jpg",
+    "creator_story_url": "/about",
+    "version": "SaarthiBhai v7.2",
+    "timezone": "Asia/Kolkata",
+    "date_format": "%Y-%m-%d",
+    "port": 5000,
+    "cors_origin": "*",
+    "public_domain": "saarthibhai-by-sparsh-singhal.onrender.com",
+    "public_scheme": "https",
+    "short_name": "SaarthiBhai",
+    "pwa_description": "SaarthiBhai — bada bhai style AI study companion"
+  },
+  "runtime": {
+    "supabase_timeout_sec": 3.0,
+    "ai_pool_workers": 6,
+    "ai_timeout_sec": 45,
+    "db_write_workers": 4,
+    "redis_max_connections": 40,
+    "semantic_cache_threshold": 0.92,
+    "cache_ttl_sec": 3600,
+    "ai_parallel_fanout": 0,
+    "library_context_enabled": true
+  },
+  "ai": {
+    "primary": "gemini",
+    "provider_order": [
+      "gemini",
+      "groq",
+      "openai",
+      "xai",
+      "deepseek",
+      "claude",
+      "perplexity",
+      "meta",
+      "mistral",
+      "qwen",
+      "openrouter"
+    ],
+    "gemini_model": "gemini-3.8-flash",
+    "gemini_flash_lite_model": "gemini-3.5-flash-lite",
+    "groq_model": "openai/gpt-oss-20b",
+    "openai_model": "gpt-5.6-luna",
+    "anthropic_model": "claude-sonnet-4-6",
+    "xai_model": "grok-4.7",
+    "deepseek_model": "deepseek-v4-flash",
+    "perplexity_model": "sonar",
+    "meta_model": "Llama-4-Maverick-17B-128E-Instruct-FP8",
+    "mistral_model": "mistral-small-latest",
+    "qwen_model": "qwen-plus",
+    "meta_base_url": "https://api.llama.com/compat/v1",
+    "qwen_base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+    "openrouter_models": [
+      "minimax/minimax-m3:free",
+      "thinkingmachines/inkling:free",
+      "google/gemma-4-31b-it:free",
+      "inclusionai/ling-3.0-flash-fin:free",
+      "nvidia/nemotron-3.5-lightning:free"
+    ],
+    "openrouter_site_url": "https://studygenie.app",
+    "openrouter_app_name": "SaarthiBhai by Sparsh Singhal",
+    "gemini_embed_model": "gemini-embedding-001",
+    "anthropic_api_version": "2023-06-01"
+  },
+  "limits": {
+    "free_daily_questions": 10,
+    "free_lifetime_questions": 12,
+    "pro_price_inr": 49,
+    "xp_question": 15,
+    "welcome_coins": 50,
+    "spin_min_coins": 5,
+    "spin_max_coins": 50,
+    "referral_coins": 20,
+    "trial_coins": 500,
+    "trial_referrals": 5,
+    "trial_days": 3,
+    "mission_reward_coins": 20,
+    "quiz_perfect_coins": 50,
+    "mistake_coins": 5,
+    "abuse_warning_limit": 3,
+    "abuse_ban_hours": 24,
+    "free_pdf_per_day": 1,
+    "free_video_links": 1,
+    "free_assignment_per_day": 1,
+    "pro_video_links": 5,
+    "pro_viva_questions": 15,
+    "pro_xp_multiplier": 2,
+    "daily_mission_minutes": 3,
+    "daily_mission_xp": 10,
+    "welcome_free_spin_count": 1,
+    "welcome_freeze_count": 1,
+    "image_max_bytes": 4194304,
+    "quiz_min_reward_coins": 0,
+    "spaced_reminder_days": [
+      1,
+      3,
+      7,
+      15
+    ]
+  },
+  "channels": {
+    "whatsapp_api_version": "v20.0",
+    "instagram_graph_version": "v23.0",
+    "snapchat_gateway_enabled": false
+  },
+  "urls": {
+    "razorpay_orders": "https://api.razorpay.com/v1/orders",
+    "razorpay_payments": "https://api.razorpay.com/v1/payments",
+    "razorpay_checkout_js": "https://checkout.razorpay.com/v1/checkout.js",
+    "openai_base_url": "https://api.openai.com/v1",
+    "anthropic_messages": "https://api.anthropic.com/v1/messages",
+    "xai_base_url": "https://api.x.ai/v1",
+    "deepseek_base_url": "https://api.deepseek.com",
+    "perplexity_base_url": "https://api.perplexity.ai",
+    "mistral_base_url": "https://api.mistral.ai/v1",
+    "openrouter_base_url": "https://openrouter.ai/api/v1",
+    "telegram_base_url": "https://api.telegram.org",
+    "whatsapp_graph_base_url": "https://graph.facebook.com",
+    "instagram_graph_base_url": "https://graph.facebook.com",
+    "youtube_api_url": "https://www.googleapis.com/youtube/v3/search",
+    "youtube_watch_base_url": "https://www.youtube.com/watch?v=",
+    "youtube_search_base_url": "https://www.youtube.com/results?search_query=",
+    "whatsapp_share_url": "https://wa.me/?text=",
+    "katex_css": "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css",
+    "katex_js": "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js",
+    "katex_auto_render_js": "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+  },
+  "content": {
+    "free_upsell_line": "Bhai free me bhi solid kiya ❤️ PRO me iske aur videos + assignments complete bhi milte saath mei aur bhi bohot kuchh milta, jab mann kare le lena, abhi bhi tu topper hai",
+    "openrouter_system_prompt": "You are SaarthiBhai. Reply in Hinglish. Use clean Markdown.",
+    "brand_style_intro": "Arre ye to easy hai sun",
+    "copyright_contact": "copyright@saarthibhai.app",
+    "abuse_words": [
+      "chutiya",
+      "madarchod",
+      "behenchod",
+      "bhosdike",
+      "bhosdiwala",
+      "randi",
+      "gandu",
+      "harami",
+      "kutta",
+      "kamina",
+      "fuck",
+      "fucker",
+      "fuck you",
+      "bitch",
+      "bastard",
+      "asshole",
+      "slut",
+      "whore"
+    ],
+    "leaderboard_hidden_names": [
+      "pro tester",
+      "dev · sparsh",
+      "dev sparsh",
+      "pro student",
+      "web student",
+      "test student sparsh",
+      "🧪 test account (hidden)",
+      "test account (hidden)"
+    ],
+    "feature_catalog_28": [
+      "photo_se_sawal",
+      "bol_ke_puchna",
+      "mcq_quiz",
+      "formula_sheet",
+      "short_notes",
+      "long_notes",
+      "youtube_nichod",
+      "pyq_bank",
+      "mind_map",
+      "mock_test",
+      "hint_wala_doubt",
+      "essay",
+      "resume",
+      "ppt",
+      "flashcards",
+      "important_questions",
+      "eli5_child_mode",
+      "hisab",
+      "diagram",
+      "grammar",
+      "bhasha_badalna",
+      "career",
+      "timetable",
+      "revision",
+      "copy_check",
+      "current_affairs",
+      "photo_notes",
+      "viva"
+    ],
+    "tool_aliases": {
+      "photo_se_sawal": "general",
+      "bol_ke_puchna": "general",
+      "mcq_quiz": "mcq",
+      "formula_sheet": "formula",
+      "short_notes": "notes",
+      "long_notes": "notes",
+      "youtube_nichod": "youtube",
+      "pyq_bank": "pyq",
+      "mind_map": "mindmap",
+      "mock_test": "mock",
+      "hint_wala_doubt": "explain",
+      "ppt": "notes",
+      "flashcards": "mcq",
+      "important_questions": "important",
+      "eli5_child_mode": "explain",
+      "hisab": "numerical",
+      "copy_check": "general",
+      "current_affairs": "general",
+      "photo_notes": "notes",
+      "viva": "mcq",
+      "placement": "career"
+    },
+    "pro_only_tools": [
+      "roast",
+      "ncert",
+      "mindmap",
+      "important",
+      "diagram",
+      "derivation",
+      "numerical",
+      "mcq",
+      "essay",
+      "resume",
+      "youtube",
+      "career",
+      "tips",
+      "mock",
+      "photo_notes",
+      "voice",
+      "flashcards",
+      "ppt",
+      "viva",
+      "placement"
+    ],
+    "tool_keywords": [
+      [
+        "explain",
+        "explain"
+      ],
+      [
+        "solve",
+        "solve"
+      ],
+      [
+        "notes",
+        "notes"
+      ],
+      [
+        "pyq",
+        "pyq"
+      ],
+      [
+        "formula",
+        "formula"
+      ],
+      [
+        "plan",
+        "planner"
+      ],
+      [
+        "mock",
+        "mock"
+      ],
+      [
+        "roast",
+        "roast"
+      ],
+      [
+        "mindmap",
+        "mindmap"
+      ],
+      [
+        "mcq",
+        "mcq"
+      ],
+      [
+        "essay",
+        "essay"
+      ],
+      [
+        "resume",
+        "resume"
+      ],
+      [
+        "career",
+        "career"
+      ],
+      [
+        "tips",
+        "tips"
+      ],
+      [
+        "ncert",
+        "ncert"
+      ],
+      [
+        "derivation",
+        "derivation"
+      ],
+      [
+        "derive",
+        "derivation"
+      ],
+      [
+        "numerical",
+        "numerical"
+      ],
+      [
+        "important",
+        "important"
+      ],
+      [
+        "diagram",
+        "diagram"
+      ],
+      [
+        "youtube",
+        "youtube"
+      ],
+      [
+        "current",
+        "current_affairs"
+      ],
+      [
+        "current affairs",
+        "current_affairs"
+      ],
+      [
+        "flashcard",
+        "flashcards"
+      ],
+      [
+        "flashcards",
+        "flashcards"
+      ],
+      [
+        "viva",
+        "viva"
+      ],
+      [
+        "placement",
+        "placement"
+      ],
+      [
+        "ppt",
+        "ppt"
+      ],
+      [
+        "photo notes",
+        "photo_notes"
+      ],
+      [
+        "voice",
+        "voice"
+      ],
+      [
+        "hint",
+        "hint_wala_doubt"
+      ],
+      [
+        "revision",
+        "revision"
+      ]
+    ],
+    "exam_map": {
+      "jee": "jee",
+      "neet": "neet",
+      "upsc": "upsc",
+      "ssc": "ssc",
+      "bank": "banking",
+      "banking": "banking",
+      "bpsc": "bpsc",
+      "dtu": "dtu",
+      "gate": "gate",
+      "cat": "cat",
+      "cuet": "cuet",
+      "ca": "ca",
+      "k12": "k12",
+      "school": "k12",
+      "class": "k12",
+      "college": "college",
+      "olympiad": "olympiad",
+      "nda": "nda",
+      "clat": "clat"
+    },
+    "subject_map": {
+      "physics": [
+        "physics",
+        "mechanics",
+        "thermodynamics",
+        "electrostatics",
+        "optics"
+      ],
+      "chemistry": [
+        "chemistry",
+        "organic chemistry",
+        "inorganic chemistry"
+      ],
+      "maths": [
+        "maths",
+        "mathematics",
+        "algebra",
+        "calculus",
+        "geometry",
+        "trigonometry"
+      ],
+      "biology": [
+        "biology",
+        "botany",
+        "zoology",
+        "genetics"
+      ],
+      "english": [
+        "english",
+        "grammar",
+        "essay",
+        "literature"
+      ],
+      "reasoning": [
+        "reasoning",
+        "logical reasoning",
+        "aptitude"
+      ],
+      "gk": [
+        "gk",
+        "general knowledge",
+        "current affairs",
+        "polity",
+        "history",
+        "geography"
+      ],
+      "computer": [
+        "computer",
+        "programming",
+        "python",
+        "coding",
+        "computer science"
+      ],
+      "economics": [
+        "economics",
+        "microeconomics",
+        "macroeconomics"
+      ],
+      "accountancy": [
+        "accountancy",
+        "accounts"
+      ],
+      "law": [
+        "law",
+        "legal",
+        "clat"
+      ]
+    },
+    "messages": {
+      "ai_empty": "ERROR: AI returned empty response.",
+      "payment_not_configured": "Razorpay not configured",
+      "payment_required": "payment_id required",
+      "payment_not_captured": "Payment not captured",
+      "payment_amount_mismatch": "Amount mismatch",
+      "payment_order_mismatch": "Order mismatch",
+      "payment_user_missing": "user_id missing from payment",
+      "already_activated": "Already activated",
+      "pro_unlocked": "Pro unlocked",
+      "order_failed": "Order failed",
+      "refund_payment_required": "payment_id required",
+      "refund_payment_verify_failed": "Could not verify payment for refund",
+      "refund_user_missing": "user_id missing from payment",
+      "partial_refund": "Partial refund recorded; Pro retained until full-price refund.",
+      "refund_revoked": "Pro revoked after full refund",
+      "pro_revoked_log": "Pro revoked after refund uid=%s payment=%s refund=%s",
+      "pro_activated_log": "Pro activated instantly for %s via payment %s"
+    },
+    "footer_signature": "made with love by {creator_name}",
+    "language_instructions": {
+      "hindi": "Reply in pure Hindi (Devanagari script) — no English mixed in except technical/scientific terms that don't have a common Hindi equivalent.",
+      "english": "Reply in plain, clear English only — no Hindi/Hinglish mixing.",
+      "hinglish": "Reply in natural Hinglish (Hindi+English mix, Roman script)."
+    },
+    "ai_base_prompt_template": "You are {brand_name} – India's fun gamified AI tutor for Class 6-12, JEE, NEET, GATE, UPSC, SSC, Banking, CA, CUET, Olympiads, School Exams, College Exams, and many more. {language_instruction} Speak like a warm 21-year-old bada bhai. Start naturally with '{style_intro}' when appropriate. Never say 'As an AI'. End with one small practice question. Be clear, exam-oriented, encouraging, use emojis. Keep answers concise (prefer under ~250 words unless user asks for detail). Use clean Markdown: headings, bold, bullet lists, and simple tables when helpful. For math use LaTeX in \\( ... \\) or $$ ... $$. Also add one plain-English line under hard formulas.\n\nFor normal study answers, prefer this compact 10-in-1 shape when relevant: ANSWER; STEP-BY-STEP (exactly 3 points); FORMULA BOX if relevant; DIAGRAM if useful (ASCII/Markdown is fine); VIDEO is supplied separately by the app so never invent a URL; CODE only when needed; TRICK/ELI5; PYQ TAG (say 'PYQ-style' unless a real PYQ source is available); MCQ CHECK (A/B/C/D); NEXT QUESTION. Never fabricate a real past-paper claim or source.",
+    "youtube_example_url": "https://youtube.com/watch?v=...",
+    "default_student_names": {
+      "web": "Web Student",
+      "telegram": "Telegram Student",
+      "whatsapp": "WhatsApp Student",
+      "instagram": "Instagram Student",
+      "snapchat": "Snapchat Student",
+      "pro": "Pro Student",
+      "generic": "Student"
+    },
+    "answer_resource_copy": {
+      "extras_heading": "📦 SaarthiBhai extras",
+      "free_pack": "10 sawal/day + 1 PDF + 1 relevant video + 1 full assignment",
+      "pro_pack": "Unlimited sawal + Top 5 videos + full assignments + viva + placement + freeze + reminders + more",
+      "free_badge": "💛 FREE: {free_video_links} video + {free_pdf_per_day} PDF + {free_assignment_per_day} assignment | PRO: Top {pro_video_links} videos + full assignments"
+    },
+    "product_text": {
+      "pro_upgrade": "Upgrade ₹{price}/30 days",
+      "pro_tool": "🔒 Pro-only tool.",
+      "free_limit": "❌ Free limit khatam",
+      "ai_busy": "SaarthiBhai abhi thoda busy hai.",
+      "pdf_title": "SaarthiBhai study sheet",
+      "resource_video_fallback_title": "Relevant video",
+      "free_plan_compare": "{free_daily}/day + {free_pdf_per_day} PDF + {free_video_links} relevant video + {free_assignment_per_day} assignment",
+      "pro_plan_compare": "Unlimited + top {pro_video_links} videos + full assignments + {pro_viva_questions} viva + placement + more",
+      "viva_prompt": "Create exactly {count} viva/interview questions with short model answers on: {topic}."
+    },
+    "system_protocol": {
+      "public_error_no_response": "Bhai, abhi response nahi aaya.",
+      "voice_unavailable": "Is browser me voice input available nahi hai.",
+      "voice_pro_only": "Voice sunna PRO feature hai.",
+      "photo_no_answer": "Photo ka answer nahi aaya.",
+      "image_too_large": "Image too large. Please use a smaller image.",
+      "ai_rate_limited": "Too many requests. Wait a minute."
+    }
+  },
+  "theme": {
+    "primary": "#FFD600",
+    "background": "#ffffff",
+    "card": "#ffffff",
+    "text": "#111111",
+    "muted": "#575757",
+    "border": "rgba(17,17,17,.12)",
+    "dark": "#0f172a",
+    "accent_blue": "#22d3ee",
+    "accent_purple": "#a78bfa",
+    "accent_pink": "#ec4899",
+    "danger": "#f87171"
+  },
+  "phone": {
+    "default_country_code": "91",
+    "normalize_10_digit_to_default_country": true
+  }
+}
