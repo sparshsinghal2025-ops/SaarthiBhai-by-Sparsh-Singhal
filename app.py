@@ -5,6 +5,8 @@ Telegram + WhatsApp + Web Dashboard
 Gemini (Primary) + OpenRouter (Fallback) | All Exams | Stats | Razorpay Pro
 UI: Branding + Pro Modal + Sounds + Dev Mode + Name Input + Markdown Render
 """
+# v7 architecture: Supabase phone identity + Redis hot cache + multi-channel adapters + Next.js/PWA companion.
+
 
 from __future__ import annotations
 
@@ -15,8 +17,11 @@ import hmac
 import json
 import logging
 import os
+import random
+import re
 import secrets
 import time
+from urllib.parse import quote, urlencode
 from collections import defaultdict
 from datetime import datetime, timedelta
 from threading import Lock
@@ -45,7 +50,41 @@ from telegram.ext import (
 
 load_dotenv()
 
-IST = ZoneInfo("Asia/Kolkata")
+
+def _load_runtime_config() -> dict:
+    """Load non-secret settings from JSON; secrets stay in environment variables."""
+    path = os.getenv("SAARTHIBHAI_CONFIG_FILE") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "saarthibhai.config.json"
+    )
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception as exc:
+        raise RuntimeError(f"SaarthiBhai config file could not be loaded: {path}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("SaarthiBhai config root must be a JSON object")
+    return data
+
+
+RUNTIME_CONFIG = _load_runtime_config()
+IST = ZoneInfo(RUNTIME_CONFIG["app"]["timezone"])
+DATE_FORMAT = str(RUNTIME_CONFIG["app"]["date_format"])
+
+
+def _setting(path: str):
+    value = RUNTIME_CONFIG
+    for part in path.split("."):
+        value = value[part]
+    return value
+
+
+def _env(name: str) -> str:
+    return os.getenv(name, "").strip()
+
+
+def _env_or_setting(name: str, path: str):
+    value = _env(name)
+    return value if value else _setting(path)
 
 
 def _now_ist() -> datetime:
@@ -53,7 +92,7 @@ def _now_ist() -> datetime:
 
 
 def _today_ist() -> str:
-    return _now_ist().strftime("%Y-%m-%d")
+    return _now_ist().strftime(DATE_FORMAT)
 
 
 logging.basicConfig(
@@ -65,70 +104,189 @@ logger = logging.getLogger("saarthibhai")
 
 class Config:
     def __init__(self) -> None:
-        self.BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-        self.VERCEL_URL = os.getenv("VERCEL_URL", "").strip()
-        self.WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-        self.REDIS_URL = (os.getenv("REDIS_URL") or os.getenv("UPSTASH_REDIS_URL") or "").strip()
+        # Secrets/tokens are environment-only.
+        self.BOT_TOKEN = _env("BOT_TOKEN")
+        self.VERCEL_URL = _env("VERCEL_URL")
+        self.WEBHOOK_SECRET = _env("WEBHOOK_SECRET")
+        self.REDIS_URL = _env("REDIS_URL") or _env("UPSTASH_REDIS_URL")
 
-        self.GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
-        self.GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
-        self.GEMINI_FLASH_LITE_MODEL = os.getenv("GEMINI_FLASH_LITE_MODEL", "gemini-3.1-flash-lite").strip()
-        self.GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-        self.GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
-        self.AI_PRIMARY = os.getenv("AI_PRIMARY", "gemini").strip().lower()
+        self.SUPABASE_URL = _env("SUPABASE_URL").rstrip("/")
+        self.SUPABASE_SECRET_KEY = _env("SUPABASE_SECRET_KEY") or _env("SUPABASE_SERVICE_ROLE_KEY")
+        self.SUPABASE_TIMEOUT = float(_env_or_setting("SUPABASE_TIMEOUT_SEC", "runtime.supabase_timeout_sec"))
+        self.SUPABASE_ENABLED = bool(self.SUPABASE_URL and self.SUPABASE_SECRET_KEY)
 
-        # --- Extra fallback providers (reliability chain) -----------------
-        # OpenRouter: genuinely free models exist (":free" suffix), rate
-        # limited to ~20 req/min and 50 req/day per key (1000/day after a
-        # one-time $10 top-up). We rotate through several free models so a
-        # single model being saturated doesn't take the whole fallback down.
-        self.OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
-        self.OPENROUTER_MODELS = [
-            m.strip() for m in os.getenv(
-                "OPENROUTER_MODELS",
-                "minimax/minimax-m3:free,"
-                "thinkingmachines/inkling:free,"
-                "google/gemma-4-31b-it:free,"
-                "inclusionai/ling-3.0-flash-fin:free,"
-                "nvidia/nemotron-3.5-lightning:free",
-            ).split(",") if m.strip()
-        ]
-        self.OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "https://studygenie.app").strip()
-        self.OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "SaarthiBhai by Sparsh Singhal").strip()
+        self.GOOGLE_API_KEY = _env("GOOGLE_API_KEY")
+        self.GEMINI_MODEL = str(_env_or_setting("GEMINI_MODEL", "ai.gemini_model"))
+        self.GEMINI_FLASH_LITE_MODEL = str(_env_or_setting("GEMINI_FLASH_LITE_MODEL", "ai.gemini_flash_lite_model"))
+        self.GROQ_API_KEY = _env("GROQ_API_KEY")
+        self.GROQ_MODEL = str(_env_or_setting("GROQ_MODEL", "ai.groq_model"))
+        self.AI_PRIMARY = str(_env_or_setting("AI_PRIMARY", "ai.primary")).lower()
 
-        self.FREE_DAILY = int(os.getenv("FREE_DAILY_QUESTIONS", "4"))
-        self.FREE_LIFETIME = int(os.getenv("FREE_LIFETIME_QUESTIONS", "12"))
+        self.OPENAI_API_KEY = _env("OPENAI_API_KEY")
+        self.OPENAI_MODEL = str(_env_or_setting("OPENAI_MODEL", "ai.openai_model"))
+        self.ANTHROPIC_API_KEY = _env("ANTHROPIC_API_KEY")
+        self.ANTHROPIC_MODEL = str(_env_or_setting("ANTHROPIC_MODEL", "ai.anthropic_model"))
+        self.XAI_API_KEY = _env("XAI_API_KEY")
+        self.XAI_MODEL = str(_env_or_setting("XAI_MODEL", "ai.xai_model"))
+        self.DEEPSEEK_API_KEY = _env("DEEPSEEK_API_KEY")
+        self.DEEPSEEK_MODEL = str(_env_or_setting("DEEPSEEK_MODEL", "ai.deepseek_model"))
+        self.PERPLEXITY_API_KEY = _env("PERPLEXITY_API_KEY")
+        self.PERPLEXITY_MODEL = str(_env_or_setting("PERPLEXITY_MODEL", "ai.perplexity_model"))
+        self.META_API_KEY = _env("META_API_KEY")
+        self.META_BASE_URL = str(_env_or_setting("META_BASE_URL", "ai.meta_base_url"))
+        self.META_MODEL = str(_env_or_setting("META_MODEL", "ai.meta_model"))
+        self.MISTRAL_API_KEY = _env("MISTRAL_API_KEY")
+        self.MISTRAL_MODEL = str(_env_or_setting("MISTRAL_MODEL", "ai.mistral_model"))
+        self.QWEN_API_KEY = _env("QWEN_API_KEY")
+        self.QWEN_BASE_URL = str(_env_or_setting("QWEN_BASE_URL", "ai.qwen_base_url"))
+        self.QWEN_MODEL = str(_env_or_setting("QWEN_MODEL", "ai.qwen_model"))
 
-        self.PRO_PRICE_INR = int(os.getenv("PRO_PRICE_INR", "49"))
-        self.RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "").strip()
-        self.RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "").strip()
-        self.RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "").strip()
+        provider_order = _env("AI_PROVIDER_ORDER")
+        order = provider_order.split(",") if provider_order else list(_setting("ai.provider_order"))
+        self.AI_PROVIDER_ORDER = [str(x).strip().lower() for x in order if str(x).strip()]
+        self.AI_PARALLEL_FANOUT = int(_env_or_setting("AI_PARALLEL_FANOUT", "runtime.ai_parallel_fanout"))
+        self.LIBRARY_CONTEXT_ENABLED = str(_env_or_setting("LIBRARY_CONTEXT_ENABLED", "runtime.library_context_enabled")).lower() not in ("0", "false", "no")
 
-        self.WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "").strip()
-        self.WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
-        self.WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "studygenie_sparsh").strip()
-        self.WHATSAPP_API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v20.0")
+        self.OPENROUTER_API_KEY = _env("OPENROUTER_API_KEY")
+        openrouter_models = _env("OPENROUTER_MODELS")
+        models = openrouter_models.split(",") if openrouter_models else list(_setting("ai.openrouter_models"))
+        self.OPENROUTER_MODELS = [str(m).strip() for m in models if str(m).strip()]
+        self.OPENROUTER_SITE_URL = str(_env_or_setting("OPENROUTER_SITE_URL", "ai.openrouter_site_url"))
+        self.OPENROUTER_APP_NAME = str(_env_or_setting("OPENROUTER_APP_NAME", "ai.openrouter_app_name"))
 
-        self.XP_QUESTION = 15
-        self.CACHE_TTL = 3600
-        # No hardcoded fallback — dev endpoints (/api/dev/*, /api/debug/ai)
-        # stay disabled until you explicitly set DEV_SECRET in your env.
-        self.DEV_SECRET = os.getenv("DEV_SECRET", "").strip()
+        self.FREE_DAILY = int(_env_or_setting("FREE_DAILY_QUESTIONS", "limits.free_daily_questions"))
+        self.FREE_LIFETIME = int(_env_or_setting("FREE_LIFETIME_QUESTIONS", "limits.free_lifetime_questions"))
+        self.PRO_PRICE_INR = int(_env_or_setting("PRO_PRICE_INR", "limits.pro_price_inr"))
+        self.RAZORPAY_KEY_ID = _env("RAZORPAY_KEY_ID")
+        self.RAZORPAY_KEY_SECRET = _env("RAZORPAY_KEY_SECRET")
+        self.RAZORPAY_WEBHOOK_SECRET = _env("RAZORPAY_WEBHOOK_SECRET")
+
+        self.WHATSAPP_TOKEN = _env("WHATSAPP_TOKEN")
+        self.WHATSAPP_PHONE_NUMBER_ID = _env("WHATSAPP_PHONE_NUMBER_ID")
+        self.WHATSAPP_VERIFY_TOKEN = _env("WHATSAPP_VERIFY_TOKEN")
+        self.WHATSAPP_API_VERSION = str(_env_or_setting("WHATSAPP_API_VERSION", "channels.whatsapp_api_version"))
+
+        self.XP_QUESTION = int(_env_or_setting("XP_QUESTION", "limits.xp_question"))
+        self.WELCOME_COINS = int(_env_or_setting("WELCOME_COINS", "limits.welcome_coins"))
+        self.SPIN_MIN_COINS = int(_env_or_setting("SPIN_MIN_COINS", "limits.spin_min_coins"))
+        self.SPIN_MAX_COINS = int(_env_or_setting("SPIN_MAX_COINS", "limits.spin_max_coins"))
+        self.REFERRAL_COINS = int(_env_or_setting("REFERRAL_COINS", "limits.referral_coins"))
+        self.TRIAL_COINS = int(_env_or_setting("TRIAL_COINS", "limits.trial_coins"))
+        self.TRIAL_REFERRALS = int(_env_or_setting("TRIAL_REFERRALS", "limits.trial_referrals"))
+        self.TRIAL_DAYS = int(_env_or_setting("TRIAL_DAYS", "limits.trial_days"))
+        self.SPACED_REMINDER_DAYS = tuple(int(x) for x in _setting("limits.spaced_reminder_days"))
+        self.MISSION_REWARD_COINS = int(_env_or_setting("MISSION_REWARD_COINS", "limits.mission_reward_coins"))
+        self.QUIZ_PERFECT_COINS = int(_env_or_setting("QUIZ_PERFECT_COINS", "limits.quiz_perfect_coins"))
+        self.MISTAKE_COINS = int(_env_or_setting("MISTAKE_COINS", "limits.mistake_coins"))
+        self.FREE_PDF_PER_DAY = int(_env_or_setting("FREE_PDF_PER_DAY", "limits.free_pdf_per_day"))
+        self.FREE_VIDEO_LINKS = int(_env_or_setting("FREE_VIDEO_LINKS", "limits.free_video_links"))
+        self.FREE_ASSIGNMENT_PER_DAY = int(_env_or_setting("FREE_ASSIGNMENT_PER_DAY", "limits.free_assignment_per_day"))
+        self.PRO_VIDEO_LINKS = int(_env_or_setting("PRO_VIDEO_LINKS", "limits.pro_video_links"))
+        self.PRO_VIVA_QUESTIONS = int(_env_or_setting("PRO_VIVA_QUESTIONS", "limits.pro_viva_questions"))
+        self.PRO_XP_MULTIPLIER = int(_env_or_setting("PRO_XP_MULTIPLIER", "limits.pro_xp_multiplier"))
+        self.DAILY_MISSION_MINUTES = int(_env_or_setting("DAILY_MISSION_MINUTES", "limits.daily_mission_minutes"))
+        self.DAILY_MISSION_XP = int(_env_or_setting("DAILY_MISSION_XP", "limits.daily_mission_xp"))
+        self.WELCOME_FREE_SPIN_COUNT = int(_env_or_setting("WELCOME_FREE_SPIN_COUNT", "limits.welcome_free_spin_count"))
+        self.WELCOME_FREEZE_COUNT = int(_env_or_setting("WELCOME_FREEZE_COUNT", "limits.welcome_freeze_count"))
+        self.IMAGE_MAX_BYTES = int(_env_or_setting("IMAGE_MAX_BYTES", "limits.image_max_bytes"))
+        self.ABUSE_WARNING_LIMIT = int(_env_or_setting("ABUSE_WARNING_LIMIT", "limits.abuse_warning_limit"))
+        self.ABUSE_BAN_HOURS = int(_env_or_setting("ABUSE_BAN_HOURS", "limits.abuse_ban_hours"))
+        abuse_words = _env("ABUSE_WORDS")
+        words = abuse_words.split(",") if abuse_words else list(_setting("content.abuse_words"))
+        self.ABUSE_WORDS = [str(w).strip().lower() for w in words if str(w).strip()]
+        self.CACHE_TTL = int(_env_or_setting("CACHE_TTL_SEC", "runtime.cache_ttl_sec"))
+        self.PUBLIC_SCHEME = str(_setting("app.public_scheme"))
+        self.ANTHROPIC_API_VERSION = str(_setting("ai.anthropic_api_version"))
+
+        self.DEV_SECRET = _env("DEV_SECRET")
+        self.BRAND_NAME = str(_setting("app.brand_name"))
+        self.CREATOR_NAME = str(_setting("app.creator_name"))
+        self.CREATOR_PHOTO_URL = str(_env_or_setting("CREATOR_PHOTO_URL", "app.creator_photo_url"))
+        self.CREATOR_STORY_URL = str(_env_or_setting("CREATOR_STORY_URL", "app.creator_story_url"))
+        self.APP_VERSION = str(_setting("app.version"))
+        self.PUBLIC_DOMAIN = str(_setting("app.public_domain"))
+        self.PUBLIC_SCHEME = str(_setting("app.public_scheme"))
+        self.SHORT_NAME = str(_setting("app.short_name"))
+        self.PWA_DESCRIPTION = str(_setting("app.pwa_description"))
+        self.CORS_ORIGIN = str(_env_or_setting("CORS_ORIGIN", "app.cors_origin"))
+        self.DEFAULT_COUNTRY_CODE = str(_setting("phone.default_country_code"))
+        self.NORMALIZE_10_DIGIT_PHONE = bool(_setting("phone.normalize_10_digit_to_default_country"))
+        self.THEME = dict(_setting("theme"))
+        self.URLS = dict(_setting("urls"))
+        self.CONTENT = dict(_setting("content"))
+        self.FREE_UPSELL_LINE = str(_setting("content.free_upsell_line"))
+        self.BRAND_STYLE_INTRO = str(_setting("content.brand_style_intro"))
+        self.COPYRIGHT_CONTACT = str(_env_or_setting("DMCA_EMAIL", "content.copyright_contact"))
+        self.FEATURE_CATALOG_28 = list(_setting("content.feature_catalog_28"))
+        self.TOOL_ALIASES = dict(_setting("content.tool_aliases"))
+        self.PRO_ONLY_TOOLS = set(_setting("content.pro_only_tools"))
+        self.TOOL_KEYWORDS = [tuple(item) for item in _setting("content.tool_keywords")]
+        self.EXAM_MAP = dict(_setting("content.exam_map"))
+        self.SUBJECT_MAP = dict(_setting("content.subject_map"))
+        self.MESSAGES = dict(_setting("content.messages"))
+        self.DEFAULT_STUDENT_NAMES = dict(_setting("content.default_student_names"))
+        self.ANSWER_RESOURCE_COPY = dict(_setting("content.answer_resource_copy"))
+        self.PRODUCT_TEXT = dict(_setting("content.product_text"))
+        self.SYSTEM_PROTOCOL = dict(_setting("content.system_protocol"))
+        self.INSTAGRAM_GRAPH_VERSION = str(_env_or_setting("INSTAGRAM_GRAPH_VERSION", "channels.instagram_graph_version"))
+        self.YOUTUBE_API_KEY = _env("YOUTUBE_API_KEY")
+        self.INSTAGRAM_ACCESS_TOKEN = _env("INSTAGRAM_ACCESS_TOKEN")
+        self.INSTAGRAM_ACCOUNT_ID = _env("INSTAGRAM_ACCOUNT_ID")
+        self.INSTAGRAM_VERIFY_TOKEN = _env("INSTAGRAM_VERIFY_TOKEN")
+        snap = _env("SNAPCHAT_DM_GATEWAY_ENABLED")
+        self.SNAPCHAT_ENABLED = snap.lower() in ("1", "true", "yes") if snap else bool(_setting("channels.snapchat_gateway_enabled"))
+        self.SNAPCHAT_DM_GATEWAY_URL = _env("SNAPCHAT_DM_GATEWAY_URL")
+        self.SNAPCHAT_DM_GATEWAY_TOKEN = _env("SNAPCHAT_DM_GATEWAY_TOKEN")
+        self.REDIS_MAX_CONN = int(_env_or_setting("REDIS_MAX_CONN", "runtime.redis_max_connections"))
+        self.AI_POOL_WORKERS = int(_env_or_setting("AI_POOL_WORKERS", "runtime.ai_pool_workers"))
+        self.AI_TIMEOUT_SEC = float(_env_or_setting("AI_TIMEOUT_SEC", "runtime.ai_timeout_sec"))
+        self.DB_WRITE_WORKERS = int(_env_or_setting("DB_WRITE_WORKERS", "runtime.db_write_workers"))
+        self.SEMANTIC_CACHE_THRESHOLD = float(_env_or_setting("SEMANTIC_CACHE_THRESHOLD", "runtime.semantic_cache_threshold"))
+        self.GEMINI_EMBED_MODEL = str(_env_or_setting("GEMINI_EMBED_MODEL", "ai.gemini_embed_model"))
+        self.PORT = int(_env_or_setting("PORT", "app.port"))
+
         self.validate()
 
     def validate(self) -> None:
         if not self.BOT_TOKEN:
-            logger.error("BOT_TOKEN is missing")
-        if not self.GROQ_API_KEY and not self.GOOGLE_API_KEY:
-            logger.error("Neither GROQ_API_KEY nor GOOGLE_API_KEY is set!")
+            logger.warning("BOT_TOKEN not configured; Telegram bot features disabled")
+        if not self.GROQ_API_KEY and not self.GOOGLE_API_KEY and not self.OPENAI_API_KEY and not self.OPENROUTER_API_KEY:
+            logger.warning("No text-generation provider API key configured")
 
 
 config = Config()
+BRAND_NAME = config.BRAND_NAME
+SW_CACHE_NAME = re.sub(r"[^a-z0-9_-]+", "-", config.APP_VERSION.lower()).strip("-")
+
+# ----------------------------------------------------------------------
+# BUILD IDENTITY — a self-hash of the running app.py, computed once at
+# startup. This exists specifically so "which version is actually live"
+# can be answered from the deployment itself (via /health) instead of by
+# comparing pasted file snapshots, which is exactly what kept going wrong
+# across our earlier audit rounds.
+# ----------------------------------------------------------------------
+def _compute_build_hash() -> str:
+    try:
+        with open(__file__, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:12]
+    except Exception as e:
+        logger.warning("_compute_build_hash: %s", e)
+        return "unknown"
+
+
+BUILD_HASH = _compute_build_hash()
+BUILD_LINE_COUNT = None
+try:
+    with open(__file__, "r", encoding="utf-8") as _f:
+        BUILD_LINE_COUNT = sum(1 for _ in _f)
+except Exception:
+    pass
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
-_AI_POOL = ThreadPoolExecutor(max_workers=int(os.getenv("AI_POOL_WORKERS", "6")), thread_name_prefix="ai")
-_AI_TIMEOUT = float(os.getenv("AI_TIMEOUT_SEC", "45"))
+_AI_POOL = ThreadPoolExecutor(max_workers=config.AI_POOL_WORKERS, thread_name_prefix="ai")
+_AI_TIMEOUT = config.AI_TIMEOUT_SEC
+_DB_WRITE_POOL = ThreadPoolExecutor(max_workers=config.DB_WRITE_WORKERS, thread_name_prefix="dbwrite")
 _rate_lock = Lock()
 _rate_buckets: dict[str, list[float]] = defaultdict(list)
 _redis_for_rl: Optional[redis.Redis] = None
@@ -175,9 +333,10 @@ def run_ai(fn, *args, **kwargs):
 
 
 
-def make_cache_key(tool: str, question: str, is_pro: bool) -> str:
+def make_cache_key(tool: str, question: str, is_pro: bool, language: str = "hinglish") -> str:
     q = " ".join((question or "").lower().split())
-    raw = f"{tool}|{1 if is_pro else 0}|{q}"
+    lang = (language or "hinglish").strip().lower()
+    raw = f"{tool}|{1 if is_pro else 0}|{lang}|{q}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:40]
 
 
@@ -195,7 +354,7 @@ def create_razorpay_order(uid: str, amount_inr: int) -> dict:
             "notes": {"user_id": str(uid)},
         }
         r = requests.post(
-            "https://api.razorpay.com/v1/orders",
+            config.URLS["razorpay_orders"],
             json=payload,
             headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
             timeout=20,
@@ -210,6 +369,70 @@ def create_razorpay_order(uid: str, amount_inr: int) -> dict:
         return {"error": str(e)}
 
 
+def process_refund(refund_id: str = "", payment_id: str = "", amount_paise: int = 0) -> dict:
+    """Handle a verified Razorpay refund event and revoke the refunded Pro entitlement.
+
+    This is intentionally conservative: it only changes the Pro plan when a payment
+    can be mapped to a user and the refund is at least the configured Pro price.
+    """
+    refund_id = (refund_id or "").strip()
+    payment_id = (payment_id or "").strip()
+    if not payment_id:
+        return {"ok": False, "error": "payment_id required"}
+    try:
+        auth = base64.b64encode(
+            f"{config.RAZORPAY_KEY_ID}:{config.RAZORPAY_KEY_SECRET}".encode()
+        ).decode()
+        r = requests.get(
+            f"{config.URLS["razorpay_payments"]}/{payment_id}",
+            headers={"Authorization": f"Basic {auth}"},
+            timeout=20,
+        )
+        payment = r.json() if r.content else {}
+        if r.status_code >= 300:
+            return {"ok": False, "error": "Could not verify payment for refund"}
+        notes = payment.get("notes") or {}
+        uid = str(notes.get("user_id") or "").strip()
+        if not uid:
+            return {"ok": False, "error": "user_id missing from payment"}
+
+        expected = int(config.PRO_PRICE_INR) * 100
+        refunded = int(amount_paise or 0)
+        # If the event did not include an amount, fetch payment's refund total.
+        if refunded <= 0:
+            rr = requests.get(
+                f"{config.URLS["razorpay_payments"]}/{payment_id}/refunds",
+                headers={"Authorization": f"Basic {auth}"},
+                timeout=20,
+            )
+            if rr.status_code < 300:
+                items = (rr.json() or {}).get("items") or []
+                refunded = sum(int(x.get("amount") or 0) for x in items)
+        if refunded < expected:
+            return {"ok": True, "uid": uid, "partial": True, "message": "Partial refund recorded; Pro retained until full-price refund."}
+
+        if db.redis and refund_id:
+            if not db.redis.set(f"refund:done:{refund_id}", "1", nx=True, ex=86400 * 365):
+                return {"ok": True, "uid": uid, "duplicate": True}
+        user = db.get_user(uid) or db.ensure_user(uid, full_name="Student", platform="web")
+        user["plan"] = "free"
+        user["pro_until"] = ""
+        user["refunded_at"] = _now_ist().isoformat()
+        user["last_refund_id"] = refund_id
+        db.save_user(uid, user)
+        try:
+            db.sync_user_to_supabase(uid, user)
+        except Exception:
+            pass
+        if db.redis:
+            db.redis.srem("stats:pro_users", str(uid))
+        logger.info("Pro revoked after refund uid=%s payment=%s refund=%s", uid, payment_id, refund_id)
+        return {"ok": True, "uid": uid, "revoked": True, "message": "Pro revoked after full refund"}
+    except Exception as e:
+        logger.error("process_refund: %s", e)
+        return {"ok": False, "error": str(e)}
+
+
 def verify_and_activate_razorpay_payment(payment_id: str, order_id: str = "", uid_hint: str = "") -> dict:
     """Verify payment with Razorpay API and activate Pro immediately (no webhook wait)."""
     if not config.RAZORPAY_KEY_ID or not config.RAZORPAY_KEY_SECRET:
@@ -222,7 +445,7 @@ def verify_and_activate_razorpay_payment(payment_id: str, order_id: str = "", ui
             f"{config.RAZORPAY_KEY_ID}:{config.RAZORPAY_KEY_SECRET}".encode()
         ).decode()
         r = requests.get(
-            f"https://api.razorpay.com/v1/payments/{payment_id}",
+            f"{config.URLS["razorpay_payments"]}/{payment_id}",
             headers={"Authorization": f"Basic {auth}"},
             timeout=20,
         )
@@ -231,8 +454,8 @@ def verify_and_activate_razorpay_payment(payment_id: str, order_id: str = "", ui
             logger.error("Razorpay payment fetch: %s", data)
             return {"ok": False, "error": data.get("error", {}).get("description", "Payment verify failed")}
         status = (data.get("status") or "").lower()
-        if status not in ("captured", "authorized"):
-            return {"ok": False, "error": f"Payment not completed ({status})"}
+        if status != "captured":
+            return {"ok": False, "error": f"Payment not captured ({status})"}
         amount = int(data.get("amount") or 0)
         expected = int(config.PRO_PRICE_INR) * 100
         if amount < expected:
@@ -245,8 +468,15 @@ def verify_and_activate_razorpay_payment(payment_id: str, order_id: str = "", ui
             return {"ok": False, "error": "user_id missing on payment"}
         if payment_id and not db.mark_payment_processed(payment_id):
             return {"ok": True, "uid": uid, "plan": "pro", "duplicate": True, "message": "Already activated"}
-        db.ensure_user(uid, full_name="Pro Student", platform="web")
+        db.ensure_user(uid, full_name=config.DEFAULT_STUDENT_NAMES["pro"], platform="web")
         db.activate_pro(uid, days=30)
+        try:
+            pu = db.get_user(uid) or {}
+            pu["last_payment_id"] = payment_id
+            db.save_user(uid, pu)
+            db.sync_user_to_supabase(uid, pu)
+        except Exception:
+            pass
         try:
             db.add_badge(uid, "Pro Warrior 👑")
         except Exception:
@@ -263,9 +493,156 @@ def verify_and_activate_razorpay_payment(payment_id: str, order_id: str = "", ui
 # DATABASE
 # ============================================================================
 
+# ============================================================================
+# SUPABASE DURABLE STORE
+# ============================================================================
+
+def normalize_phone(phone: str) -> str:
+    """Return a stable phone identifier. Indian 10-digit numbers get +91."""
+    raw = (phone or "").strip()
+    if not raw:
+        return ""
+    # WhatsApp often sends +9198... and web forms may send spaces/dashes.
+    digits = re.sub(r"\D", "", raw)
+    if not digits:
+        return ""
+    if len(digits) == 10 and config.NORMALIZE_10_DIGIT_PHONE:
+        digits = config.DEFAULT_COUNTRY_CODE + digits
+    return "+" + digits
+
+
+def guess_exam_subject(question: str, exam_type: str = "", subject: str = "") -> Tuple[str, str]:
+    """Lightweight, deterministic tags for master_cache metadata."""
+    q = (question or "").lower()
+    ex = (exam_type or "").strip().lower()
+    sub = (subject or "").strip().lower()
+    exam_map = config.EXAM_MAP
+    if not ex:
+        for k, v in exam_map.items():
+            if re.search(r"\b" + re.escape(k) + r"\b", q):
+                ex = v
+                break
+    if not ex:
+        ex = "general"
+    subject_map = config.SUBJECT_MAP
+    if not sub:
+        for candidate, words in subject_map.items():
+            if any(w in q for w in words):
+                sub = candidate
+                break
+    return ex[:64] or "general", (sub[:64] or "general")
+
+
+class SupabaseStore:
+    """Small REST wrapper using Supabase's Data API; no extra SDK dependency."""
+    def __init__(self) -> None:
+        self.enabled = bool(config.SUPABASE_ENABLED)
+        self.base = f"{config.SUPABASE_URL}/rest/v1" if self.enabled else ""
+        self.headers = ({
+            "apikey": config.SUPABASE_SECRET_KEY,
+            "Authorization": f"Bearer {config.SUPABASE_SECRET_KEY}",
+            "Content-Type": "application/json",
+        } if self.enabled else {})
+        if self.enabled:
+            logger.info("Supabase REST enabled")
+        else:
+            logger.warning("Supabase disabled — set SUPABASE_URL + SUPABASE_SECRET_KEY")
+
+    def _url(self, table: str) -> str:
+        return f"{self.base}/{table}"
+
+    def _request(self, method: str, table_or_rpc: str, **kwargs):
+        if not self.enabled:
+            return None
+        try:
+            return requests.request(
+                method, self._url(table_or_rpc) if not table_or_rpc.startswith("rpc/") else f"{self.base}/{table_or_rpc}",
+                headers=self.headers, timeout=config.SUPABASE_TIMEOUT, **kwargs
+            )
+        except Exception as e:
+            logger.warning("Supabase %s %s: %s", method, table_or_rpc, e)
+            return None
+
+    def upsert(self, table: str, row: Dict[str, Any], on_conflict: str) -> bool:
+        if not self.enabled or not row:
+            return False
+        try:
+            h = dict(self.headers)
+            h["Prefer"] = "resolution=merge-duplicates,return=minimal"
+            r = requests.post(
+                f"{self._url(table)}?on_conflict={quote(on_conflict, safe=',')}",
+                headers=h, json=row, timeout=config.SUPABASE_TIMEOUT,
+            )
+            if r.status_code >= 300:
+                logger.warning("Supabase upsert %s %s: %s", table, r.status_code, r.text[:500])
+                return False
+            return True
+        except Exception as e:
+            logger.warning("Supabase upsert %s: %s", table, e)
+            return False
+
+    def insert(self, table: str, row: Dict[str, Any]) -> bool:
+        if not self.enabled:
+            return False
+        try:
+            r = requests.post(f"{self._url(table)}", headers=self.headers, json=row, timeout=config.SUPABASE_TIMEOUT)
+            if r.status_code >= 300:
+                logger.warning("Supabase insert %s %s: %s", table, r.status_code, r.text[:500])
+                return False
+            return True
+        except Exception as e:
+            logger.warning("Supabase insert %s: %s", table, e)
+            return False
+
+    def select_one(self, table: str, filters: Dict[str, str], columns: str = "*") -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+        params = {"select": columns, **filters}
+        try:
+            r = requests.get(self._url(table), headers=self.headers, params=params, timeout=config.SUPABASE_TIMEOUT)
+            if r.status_code >= 300:
+                return None
+            data = r.json() or []
+            return data[0] if data else None
+        except Exception as e:
+            logger.warning("Supabase select %s: %s", table, e)
+            return None
+
+    def select_many(self, table: str, filters: Dict[str, str], limit: int = 5, columns: str = "*") -> List[Dict[str, Any]]:
+        if not self.enabled:
+            return []
+        params = {"select": columns, "limit": str(limit), **filters}
+        try:
+            r = requests.get(self._url(table), headers=self.headers, params=params, timeout=config.SUPABASE_TIMEOUT)
+            if r.status_code >= 300:
+                return []
+            data = r.json()
+            return data if isinstance(data, list) else []
+        except Exception as e:
+            logger.warning("Supabase select many %s: %s", table, e)
+            return []
+
+    def rpc(self, fn: str, payload: Dict[str, Any]) -> Optional[Any]:
+        if not self.enabled:
+            return None
+        try:
+            r = requests.post(f"{self.base}/rpc/{fn}", headers=self.headers, json=payload, timeout=config.SUPABASE_TIMEOUT)
+            if r.status_code >= 300:
+                logger.debug("Supabase RPC %s %s: %s", fn, r.status_code, r.text[:400])
+                return None
+            return r.json()
+        except Exception as e:
+            logger.debug("Supabase RPC %s: %s", fn, e)
+            return None
+
+
+supa = SupabaseStore()
+
+
 class Database:
     def __init__(self) -> None:
         self.redis = self._connect()
+        self.supabase = supa
         self._quota_script = None
         if self.redis:
             try:
@@ -281,7 +658,7 @@ class Database:
             pool = redis.ConnectionPool.from_url(
                 config.REDIS_URL,
                 decode_responses=True,
-                max_connections=int(os.getenv("REDIS_MAX_CONN", "40")),
+                max_connections=config.REDIS_MAX_CONN,
                 socket_timeout=5,
                 socket_connect_timeout=5,
                 socket_keepalive=True,
@@ -327,13 +704,51 @@ class Database:
         return f"user:{uid}"
 
     def get_user(self, uid: str | int) -> Optional[Dict[str, str]]:
-        if not self.redis:
-            return None
-        try:
-            data = self.redis.hgetall(self._key(uid))
-            return data or None
-        except Exception:
-            return None
+        uid = str(uid)
+        if self.redis:
+            try:
+                data = self.redis.hgetall(self._key(uid))
+                if data:
+                    return data
+            except Exception:
+                pass
+
+        # Durable recovery: Redis may be empty after a deploy/restart.
+        if self.supabase.enabled:
+            try:
+                phone = normalize_phone(uid) if re.fullmatch(r"\+?[0-9 ()-]{10,20}", uid) else ""
+                if uid.startswith("wa:"):
+                    phone = normalize_phone(uid[3:])
+                row = None
+                if phone:
+                    row = self.supabase.select_one("users", {"phone_number": f"eq.{phone}"})
+                if not row:
+                    row = self.supabase.select_one("users", {"legacy_uid": f"eq.{uid}"})
+                if row:
+                    data: Dict[str, str] = {}
+                    for k, v in row.items():
+                        if isinstance(v, (dict, list)):
+                            data[k] = json.dumps(v)
+                        elif v is None:
+                            data[k] = ""
+                        else:
+                            data[k] = str(v)
+                    data.setdefault("user_id", uid)
+                    data.setdefault("badges", "[]")
+                    data.setdefault("language_pref", "hinglish")
+                    data.setdefault("platform", "web")
+                    data.setdefault("plan", "free")
+                    data.setdefault("coins", "0")
+                    data.setdefault("xp", "0")
+                    data.setdefault("level", "1")
+                    data.setdefault("streak", "0")
+                    data.setdefault("fire_streak", data.get("streak", "0"))
+                    if self.redis:
+                        self.save_user(uid, data)
+                    return data
+            except Exception as e:
+                logger.debug("Supabase user recovery failed: %s", e)
+        return None
 
     def save_user(self, uid: str | int, data: Dict[str, Any]) -> bool:
         if not self.redis:
@@ -349,41 +764,84 @@ class Database:
             logger.error("save_user: %s", e)
             return False
 
-    def ensure_user(self, uid: str | int, username: str = "", full_name: str = "", platform: str = "telegram", referred_by: str = "") -> Dict[str, str]:
+    def ensure_user(self, uid: str | int, username: str = "", full_name: str = "", platform: str = "telegram", referred_by: str = "", phone_number: str = "", exam_type: str = "", subject: str = "") -> Dict[str, str]:
+        uid = str(uid)
+        inferred_phone = normalize_phone(phone_number or (uid[3:] if uid.startswith("wa:") else ""))
         user = self.get_user(uid)
+        # Cross-device recovery: same phone should reopen the durable student profile.
+        if not user and inferred_phone and self.supabase.enabled:
+            try:
+                row = self.supabase.select_one("users", {"phone_number": f"eq.{inferred_phone}"})
+                if row:
+                    user = {}
+                    for k, v in row.items():
+                        user[k] = json.dumps(v) if isinstance(v, (dict, list)) else ("" if v is None else str(v))
+                    user.setdefault("user_id", uid)
+                    user.setdefault("legacy_uid", uid)
+                    if self.redis:
+                        self.save_user(uid, user)
+            except Exception as e:
+                logger.debug("Supabase phone recovery failed: %s", e)
         if user:
+            changed = False
+            p = normalize_phone(phone_number)
+            if p and p != user.get("phone_number", ""):
+                user["phone_number"] = p; changed = True
+            if exam_type:
+                user["exam_type"] = exam_type.strip().lower(); changed = True
+            if subject:
+                user["subject"] = subject.strip().lower(); changed = True
+            user["updated_at"] = _now_ist().isoformat()
+            if changed:
+                self.save_user(uid, user)
             if self.redis:
                 try:
                     self.redis.sadd("stats:users", str(uid))
                 except Exception:
                     pass
+            self.sync_user_to_supabase(uid, user)
             return user
         data = {
             "user_id": str(uid),
             "username": username or "",
-            "full_name": full_name or "Student",
+            "full_name": full_name or config.DEFAULT_STUDENT_NAMES["generic"],
             "platform": platform,
             "plan": "free",
             "pro_until": "",
             "xp": "0",
             "level": "1",
+            "coins": str(config.WELCOME_COINS),
+            "language_pref": "hinglish",
             "streak": "0",
             "best_streak": "0",
-            "shields": "0",
+            "shields": "1",
+            "onboarding_gift_claimed": "1",
             "questions_asked": "0",
             "badges": "[]",
             "referral_code": secrets.token_hex(4).upper(),
             "referred_by": "",
             "referral_count": "0",
-            "last_activity": _today_ist(),
+            "phone_number": inferred_phone,
+            "exam_type": (exam_type or "general").strip().lower(),
+            "subject": (subject or "general").strip().lower(),
+            "fire_streak": "0",
+            "learner_track": "school_college",
+            "onboarding_gift_claimed": "1",
+            "trial_granted": "0",
+            "correct_answers": "0",
+            "wrong_answers": "0",
+            "last_question_at": "",
             "created_at": _today_ist(),
+            "updated_at": _now_ist().isoformat(),
         }
         self.save_user(uid, data)
         if self.redis:
             try:
                 self.redis.sadd("stats:users", str(uid))
+                self.redis.set(f"welcome_flash:{self._key(uid)}", "1", nx=True, ex=120)
             except Exception:
                 pass
+        self.sync_user_to_supabase(uid, data)
         # Register this user's own referral code immediately so anyone can
         # refer them from the moment they exist — regardless of which
         # platform (Telegram/Web/WhatsApp) created the account.
@@ -396,6 +854,163 @@ class Database:
         except Exception:
             pass
         return self.get_user(uid) or data
+
+    def _supabase_user_key(self, uid: str | int, user: Optional[Dict[str, Any]] = None) -> str:
+        user = user or self.get_user(uid) or {}
+        return normalize_phone(user.get("phone_number", ""))
+
+    def sync_user_to_supabase(self, uid: str | int, user: Optional[Dict[str, Any]] = None) -> bool:
+        """Persist a user's profile/score to Supabase only when phone is known.
+        Redis remains the hot operational store for backwards compatibility."""
+        u = user or self.get_user(uid)
+        if not u:
+            return False
+        phone = self._supabase_user_key(uid, u)
+        if not phone:
+            return False
+        badges = u.get("badges", "[]")
+        try:
+            badges_json = json.loads(badges) if isinstance(badges, str) else badges
+        except Exception:
+            badges_json = []
+        row = {
+            "phone_number": phone,
+            "legacy_uid": str(uid),
+            "username": u.get("username", ""),
+            "full_name": u.get("full_name", config.DEFAULT_STUDENT_NAMES["generic"]),
+            "platform": u.get("platform", "web"),
+            "plan": u.get("plan", "free"),
+            "pro_until": u.get("pro_until") or None,
+            "coins": int(u.get("coins", 0) or 0),
+            "streak": int(u.get("streak", 0) or 0),
+            "fire_streak": int(u.get("fire_streak", u.get("streak", 0)) or 0),
+            "best_streak": int(u.get("best_streak", 0) or 0),
+            "shields": int(u.get("shields", 0) or 0),
+            "xp": int(u.get("xp", 0) or 0),
+            "level": int(u.get("level", 1) or 1),
+            "questions_asked": int(u.get("questions_asked", 0) or 0),
+            "correct_answers": int(u.get("correct_answers", 0) or 0),
+            "wrong_answers": int(u.get("wrong_answers", 0) or 0),
+            "exam_type": u.get("exam_type") or "general",
+            "subject": u.get("subject") or "general",
+            "language_pref": u.get("language_pref") or "hinglish",
+            "badges": badges_json,
+            "referral_code": u.get("referral_code", ""),
+            "referred_by": u.get("referred_by", "") or None,
+            "referral_count": int(u.get("referral_count", 0) or 0),
+            "parent_phone": normalize_phone(u.get("parent_phone", "")) or None,
+            "exam_date": u.get("exam_date") or None,
+            "exam_subject": u.get("exam_subject") or None,
+            "last_activity": u.get("last_activity") or _today_ist(),
+            "last_question_at": u.get("last_question_at") or None,
+        }
+        # Non-blocking write so Supabase never makes the AI response wait.
+        try:
+            _DB_WRITE_POOL.submit(self.supabase.upsert, "users", row, "phone_number")
+            return True
+        except Exception:
+            return False
+
+    def set_phone_number(self, uid: str | int, phone_number: str) -> bool:
+        phone = normalize_phone(phone_number)
+        if not phone:
+            return False
+        user = self.get_user(uid) or self.ensure_user(uid)
+        user["phone_number"] = phone
+        user["updated_at"] = _now_ist().isoformat()
+        ok = self.save_user(uid, user)
+        if ok:
+            self.sync_user_to_supabase(uid, user)
+        return ok
+
+    def add_personal_history(self, uid: str | int, question: str, tool: str = "general",
+                             exam_type: str = "", subject: str = "", user_answer: str = "",
+                             correct_answer: str = "", is_correct: Optional[bool] = None,
+                             error_reason: str = "", source_cache: str = "") -> bool:
+        user = self.get_user(uid) or {}
+        phone = self._supabase_user_key(uid, user)
+        if not phone or not question or not self.supabase.enabled:
+            return False
+        ex, sub = guess_exam_subject(question, exam_type or user.get("exam_type", ""), subject or user.get("subject", ""))
+        row = {
+            "phone_number": phone, "question": question[:4000], "tool": tool[:64],
+            "exam_type": ex, "subject": sub, "user_answer": user_answer[:2000],
+            "correct_answer": correct_answer[:2000], "is_correct": is_correct,
+            "error_reason": error_reason[:1000], "source_cache": source_cache[:32] or None,
+        }
+        try:
+            _DB_WRITE_POOL.submit(self.supabase.insert, "personal_history", row)
+            return True
+        except Exception:
+            return False
+
+    def touch_master_cache(self, question: str, answer: str = "", tool: str = "general",
+                           exam_type: str = "", subject: str = "", source: str = "ai",
+                           phone_number: str = "") -> None:
+        if not self.supabase.enabled or not question:
+            return
+        ex, sub = guess_exam_subject(question, exam_type, subject)
+        q = " ".join(question.lower().split())
+        hash_material = f"{tool}|{ex}|{sub}|{q}"
+        qhash = hashlib.sha256(hash_material.encode("utf-8")).hexdigest()
+        row = {
+            "question_hash": qhash, "question": question[:4000], "answer": (answer or "")[:12000],
+            "tool": tool[:64], "exam_type": ex, "subject": sub, "source": source[:32],
+            "ask_count": 1,
+        }
+        def _write():
+            # First try an RPC incrementer (created by the SQL migration).
+            if self.supabase.rpc("touch_master_cache", {
+                "p_question_hash": qhash, "p_question": row["question"], "p_answer": row["answer"],
+                "p_tool": row["tool"], "p_exam_type": ex, "p_subject": sub, "p_source": row["source"],
+                "p_phone_number": normalize_phone(phone_number),
+            }) is not None:
+                return
+            existing = self.supabase.select_one("master_cache", {"question_hash": f"eq.{qhash}"}, "question_hash,ask_count")
+            if existing:
+                row["ask_count"] = int(existing.get("ask_count") or 0) + 1
+            self.supabase.upsert("master_cache", row, "question_hash")
+        try:
+            _DB_WRITE_POOL.submit(_write)
+        except Exception:
+            pass
+
+    def get_master_cache(self, question: str, tool: str = "general", exam_type: str = "", subject: str = "", phone_number: str = "") -> Optional[Dict[str, Any]]:
+        if not self.supabase.enabled or not question:
+            return None
+        q = " ".join(question.lower().split())
+        ex, sub = guess_exam_subject(question, exam_type, subject)
+        hash_material = f"{tool}|{ex}|{sub}|{q}"
+        qhash = hashlib.sha256(hash_material.encode("utf-8")).hexdigest()
+        row = self.supabase.select_one("master_cache", {"question_hash": f"eq.{qhash}"})
+        if row and row.get("answer"):
+            # Increment in background; never block the hot read.
+            self.touch_master_cache(question, answer=row.get("answer", ""), tool=tool, exam_type=exam_type, subject=subject, source="master_cache_hit", phone_number=phone_number)
+            return row
+        return None
+
+    def search_library(self, question: str, exam_type: str = "", subject: str = "", limit: int = 3) -> List[Dict[str, Any]]:
+        if not self.supabase.enabled or not config.LIBRARY_CONTEXT_ENABLED or not question:
+            return []
+        ex, sub = guess_exam_subject(question, exam_type, subject)
+        words = [w for w in re.findall(r"[A-Za-z0-9]{4,}", question.lower())[:6]]
+        if not words:
+            return []
+        # A small OR-style ILIKE search; it is intentionally conservative to protect latency.
+        filters = {"limit": str(limit)}
+        rows: List[Dict[str, Any]] = []
+        # Try subject/exam first, then a broader public search.
+        try:
+            params = {"select": "title,content,source_type,exam_type,subject,url", "limit": str(limit),
+                      "or": "(" + ",".join([f"title.ilike.*{w}*,content.ilike.*{w}*" for w in words[:3]]) + ")"}
+            if ex != "general": params["exam_type"] = f"eq.{ex}"
+            if sub != "general": params["subject"] = f"eq.{sub}"
+            r = requests.get(self.supabase._url("library"), headers=self.supabase.headers, params=params, timeout=config.SUPABASE_TIMEOUT)
+            if r.status_code < 300:
+                rows = r.json() or []
+        except Exception:
+            rows = []
+        return rows[:limit]
 
     def apply_referral(self, new_uid: str | int, ref_code: str) -> bool:
         """Reward both the new user and the referrer with bonus free questions / XP.
@@ -419,6 +1034,9 @@ class Database:
             # Bonus: +2 lifetime questions for the new user (soft, capped)
             today = _today_ist()
             self.redis.decrby(f"quota:lifetime:{new_uid}", 2)
+            # POINT 25 — both sides get coins for the referral.
+            self.add_coins(new_uid, config.REFERRAL_COINS)
+            self.add_coins(referrer_uid, config.REFERRAL_COINS)
             ref_user = self.get_user(referrer_uid)
             if ref_user:
                 count = int(ref_user.get("referral_count", 0) or 0) + 1
@@ -454,6 +1072,67 @@ class Database:
             pipe.execute()
         except Exception as e:
             logger.warning("track_activity: %s", e)
+
+    # ------------------------------------------------------------------
+    # POINT 3/19 — ABUSE MODERATION: 3 soft warnings, then a 24h auto-ban.
+    # Warning count resets once the ban expires (fresh start, not a
+    # permanent strike record — matches the spec's "3 warning ke baad
+    # 24 ghante ka ban" rather than a lifetime three-strikes policy).
+    # ------------------------------------------------------------------
+    def is_banned(self, uid: str | int) -> bool:
+        if not self.redis:
+            return False
+        try:
+            return bool(self.redis.get(f"banned:{uid}"))
+        except Exception:
+            return False
+
+    def get_ban_remaining_seconds(self, uid: str | int) -> int:
+        if not self.redis:
+            return 0
+        try:
+            ttl = self.redis.ttl(f"banned:{uid}")
+            return max(0, ttl)
+        except Exception:
+            return 0
+
+    def record_abuse_warning(self, uid: str | int) -> Tuple[int, bool]:
+        """Increments the warning counter. Returns (warning_count, just_banned).
+        On hitting config.ABUSE_WARNING_LIMIT, bans for config.ABUSE_BAN_HOURS
+        and resets the counter."""
+        if not self.redis:
+            return (1, False)
+        try:
+            key = f"abusewarn:{uid}"
+            count = self.redis.incr(key)
+            self.redis.expire(key, 86400 * 30)  # warnings don't linger forever
+            if count >= config.ABUSE_WARNING_LIMIT:
+                self.redis.setex(f"banned:{uid}", config.ABUSE_BAN_HOURS * 3600, "1")
+                self.redis.delete(key)
+                return (count, True)
+            return (count, False)
+        except Exception as e:
+            logger.warning("record_abuse_warning: %s", e)
+            return (1, False)
+
+    def get_abuse_warning_count(self, uid: str | int) -> int:
+        if not self.redis:
+            return 0
+        try:
+            return int(self.redis.get(f"abusewarn:{uid}") or 0)
+        except Exception:
+            return 0
+
+    def unban_user(self, uid: str | int) -> bool:
+        """Admin escape hatch — used by /api/dev/unban."""
+        if not self.redis:
+            return False
+        try:
+            self.redis.delete(f"banned:{uid}")
+            self.redis.delete(f"abusewarn:{uid}")
+            return True
+        except Exception:
+            return False
 
     def is_pro(self, uid: str | int) -> bool:
         user = self.get_user(uid)
@@ -522,6 +1201,7 @@ class Database:
                 xp = int(results[1] or 0)
                 level = (xp // 100) + 1
                 self.redis.hset(key, "level", str(level))
+                self.sync_user_to_supabase(uid)
                 try:
                     u = self.get_user(uid)
                     if self.is_test_user(uid, u):
@@ -540,7 +1220,70 @@ class Database:
         user["xp"] = str(xp)
         user["level"] = str(level)
         self.save_user(uid, user)
+        self.sync_user_to_supabase(uid, user)
         return xp, level
+
+    # ------------------------------------------------------------------
+    # COINS (POINT 8/17/25/36) — separate currency from XP. Used for the
+    # welcome gift, daily spin wheel, quiz rewards, and referral bonuses.
+    # XP drives Level/Leaderboard; coins are the spendable "game" currency
+    # (kept simple here — no shop yet, just a running balance).
+    # ------------------------------------------------------------------
+    def add_coins(self, uid: str | int, amount: int) -> int:
+        """Atomically add (or subtract, if amount<0) coins. Returns new balance."""
+        uid = str(uid)
+        self.ensure_user(uid)
+        if self.redis:
+            try:
+                key = self._key(uid)
+                pipe = self.redis.pipeline()
+                pipe.hincrby(key, "coins", int(amount))
+                pipe.expire(key, 86400 * 120)
+                results = pipe.execute()
+                bal = int(results[0] or 0)
+                if bal < 0:
+                    self.redis.hset(key, "coins", "0")
+                    bal = 0
+                self.sync_user_to_supabase(uid)
+                return bal
+            except Exception as e:
+                logger.warning("add_coins: %s", e)
+        user = self.get_user(uid) or self.ensure_user(uid)
+        bal = max(0, int(user.get("coins", 0) or 0) + int(amount))
+        user["coins"] = str(bal)
+        self.save_user(uid, user)
+        self.sync_user_to_supabase(uid, user)
+        return bal
+
+    def get_coins(self, uid: str | int) -> int:
+        user = self.get_user(uid)
+        return int((user or {}).get("coins", 0) or 0)
+
+    def spin_used_today(self, uid: str | int) -> bool:
+        """POINT 36 — one spin per account per day (anti-loot cap)."""
+        if not self.redis:
+            return False
+        try:
+            return bool(self.redis.get(f"spin:{uid}:{_today_ist()}"))
+        except Exception:
+            return False
+
+    def do_spin(self, uid: str | int) -> Optional[int]:
+        """Atomically claim today's spin and award a random coin amount in
+        [SPIN_MIN_COINS, SPIN_MAX_COINS]. Returns the amount won, or None
+        if already spun today."""
+        if self.redis:
+            try:
+                key = f"spin:{uid}:{_today_ist()}"
+                if not self.redis.set(key, "1", nx=True, ex=90000):
+                    return None
+            except Exception as e:
+                logger.warning("do_spin lock: %s", e)
+        elif self.spin_used_today(uid):
+            return None
+        amount = secrets.randbelow(config.SPIN_MAX_COINS - config.SPIN_MIN_COINS + 1) + config.SPIN_MIN_COINS
+        self.add_coins(uid, amount)
+        return amount
 
     def update_streak(self, uid: str | int) -> Dict[str, int]:
         user = self.get_user(uid)
@@ -554,7 +1297,7 @@ class Database:
                 "best": int(user.get("best_streak", 0)),
                 "shields": int(user.get("shields", 0)),
             }
-        yesterday = (_now_ist() - timedelta(days=1)).strftime("%Y-%m-%d")
+        yesterday = (_now_ist() - timedelta(days=1)).strftime(DATE_FORMAT)
         current = int(user.get("streak", 0))
         shields = int(user.get("shields", 0))
         if last == yesterday:
@@ -567,8 +1310,9 @@ class Database:
         if new > 0 and new % 7 == 0:
             shields += 1
         best = max(new, int(user.get("best_streak", 0)))
-        user.update({"streak": str(new), "best_streak": str(best), "shields": str(shields), "last_activity": today})
+        user.update({"streak": str(new), "best_streak": str(best), "shields": str(shields), "fire_streak": str(new), "last_activity": today})
         self.save_user(uid, user)
+        self.sync_user_to_supabase(uid, user)
         return {"current": new, "best": best, "shields": shields}
 
     # ------------------------------------------------------------------
@@ -788,7 +1532,7 @@ class Database:
                 u = self.get_user(uid)
                 if self._is_hidden_leaderboard_user(str(uid), u):
                     continue
-                name = (u or {}).get("full_name", "Student")[:20]
+                name = (u or {}).get("full_name", config.DEFAULT_STUDENT_NAMES["generic"])[:20]
                 if not name or name.strip().lower() in self._LB_HIDDEN_NAMES:
                     continue
                 rank += 1
@@ -904,6 +1648,457 @@ class Database:
                 "real_pro_humans_est": 0,
             }
 
+    # ------------------------------------------------------------------
+    # POINT 24 — LANGUAGE PREFERENCE (Hindi / Hinglish / English)
+    # ------------------------------------------------------------------
+    def set_language(self, uid: str | int, lang: str) -> bool:
+        lang = (lang or "hinglish").strip().lower()
+        if lang not in ("hindi", "hinglish", "english"):
+            lang = "hinglish"
+        user = self.get_user(uid) or self.ensure_user(uid)
+        user["language_pref"] = lang
+        return self.save_user(uid, user)
+
+    def get_language(self, uid: str | int) -> str:
+        user = self.get_user(uid)
+        return ((user or {}).get("language_pref") or "hinglish").strip().lower()
+
+    # ------------------------------------------------------------------
+    # POINT 32 / GALTI DIARY — mistake tracker (wrong quiz answers,
+    # anything the user got wrong). Stored as a capped Redis list per user.
+    # ------------------------------------------------------------------
+    def record_answer_outcome(self, uid: str | int, is_correct: bool) -> None:
+        uid = str(uid)
+        self.ensure_user(uid)
+        if self.redis:
+            try:
+                field = "correct_answers" if is_correct else "wrong_answers"
+                self.redis.hincrby(self._key(uid), field, 1)
+                self.sync_user_to_supabase(uid)
+            except Exception:
+                pass
+
+    def add_mistake(self, uid: str | int, question: str, tool: str = "quiz",
+                     correct_answer: str = "", user_answer: str = "", topic: str = "") -> int:
+        """Logs a mistake AND rewards a few coins for attempting (POINT 32 —
+        'Galti pe Inaam': don't punish wrong attempts, encourage them).
+        Returns the coin amount awarded (0 if it couldn't be logged)."""
+        if not self.redis or not question:
+            return 0
+        try:
+            entry = json.dumps({
+                "question": question[:500],
+                "tool": tool,
+                "correct_answer": (correct_answer or "")[:500],
+                "user_answer": (user_answer or "")[:300],
+                "topic": (topic or "")[:100],
+                "added_at": _today_ist(),
+            })
+            key = f"galti:{uid}"
+            pipe = self.redis.pipeline()
+            pipe.lpush(key, entry)
+            pipe.ltrim(key, 0, 199)  # keep last 200 mistakes
+            pipe.expire(key, 86400 * 120)
+            pipe.execute()
+            self.add_coins(uid, config.MISTAKE_COINS)
+            return config.MISTAKE_COINS
+        except Exception as e:
+            logger.warning("add_mistake: %s", e)
+            return 0
+
+    def get_mistakes(self, uid: str | int, limit: int = 20) -> List[Dict]:
+        if not self.redis:
+            return []
+        try:
+            raw = self.redis.lrange(f"galti:{uid}", 0, max(0, limit - 1))
+            out = []
+            for r in raw:
+                try:
+                    out.append(json.loads(r))
+                except Exception:
+                    continue
+            return out
+        except Exception:
+            return []
+
+    def clear_mistake(self, uid: str | int, index: int) -> bool:
+        """Remove one mistake by list index (as returned by get_mistakes)."""
+        if not self.redis:
+            return False
+        try:
+            key = f"galti:{uid}"
+            items = self.redis.lrange(key, 0, -1)
+            if index < 0 or index >= len(items):
+                return False
+            placeholder = f"__DELETED__:{secrets.token_hex(4)}"
+            self.redis.lset(key, index, placeholder)
+            self.redis.lrem(key, 1, placeholder)
+            return True
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------
+    # QUIZ — storage for generated quizzes + attempts + simple per-topic
+    # weakness analysis. Practice / Exam / 1v1-challenge modes are all
+    # driven from the same stored quiz object.
+    # ------------------------------------------------------------------
+    def save_quiz(self, quiz_id: str, data: Dict[str, Any], ttl: int = 86400 * 7) -> bool:
+        if not self.redis:
+            return False
+        try:
+            self.redis.setex(f"quiz:{quiz_id}", ttl, json.dumps(data))
+            return True
+        except Exception as e:
+            logger.warning("save_quiz: %s", e)
+            return False
+
+    def get_quiz(self, quiz_id: str) -> Optional[Dict[str, Any]]:
+        if not self.redis:
+            return None
+        try:
+            raw = self.redis.get(f"quiz:{quiz_id}")
+            return json.loads(raw) if raw else None
+        except Exception:
+            return None
+
+    def save_quiz_attempt(self, uid: str | int, quiz_id: str, score: int, total: int,
+                           topic: str = "", mode: str = "practice") -> None:
+        if not self.redis:
+            return
+        try:
+            entry = json.dumps({
+                "quiz_id": quiz_id, "score": score, "total": total,
+                "topic": topic, "mode": mode, "date": _today_ist(),
+            })
+            key = f"quizhist:{uid}"
+            pipe = self.redis.pipeline()
+            pipe.lpush(key, entry)
+            pipe.ltrim(key, 0, 49)
+            pipe.expire(key, 86400 * 120)
+            pipe.execute()
+        except Exception as e:
+            logger.warning("save_quiz_attempt: %s", e)
+
+    def get_daily_quiz_used(self, uid: str | int) -> bool:
+        """FREE users get 1 quiz/day (3 Qs). Returns True if already used today."""
+        if not self.redis:
+            return False
+        try:
+            return bool(self.redis.get(f"quizdaily:{uid}:{_today_ist()}"))
+        except Exception:
+            return False
+
+    def mark_daily_quiz_used(self, uid: str | int) -> None:
+        if not self.redis:
+            return
+        try:
+            self.redis.setex(f"quizdaily:{uid}:{_today_ist()}", 90000, "1")
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # POINT 10 — 1v1 "Dost se Panga" challenge results. Both players play
+    # the SAME quiz_id independently (via a shared link); each result is
+    # recorded here so either side can poll and see a simple leaderboard.
+    # ------------------------------------------------------------------
+    def record_challenge_result(self, quiz_id: str, uid: str | int, name: str, score: int, total: int) -> None:
+        if not self.redis:
+            return
+        try:
+            key = f"challenge:{quiz_id}"
+            self.redis.hset(key, str(uid), json.dumps({"name": name, "score": score, "total": total}))
+            self.redis.expire(key, 86400 * 7)
+        except Exception as e:
+            logger.warning("record_challenge_result: %s", e)
+
+    def get_challenge_results(self, quiz_id: str) -> List[Dict]:
+        if not self.redis:
+            return []
+        try:
+            raw = self.redis.hgetall(f"challenge:{quiz_id}") or {}
+            out = []
+            for uid, payload in raw.items():
+                try:
+                    d = json.loads(payload)
+                    d["uid"] = uid
+                    out.append(d)
+                except Exception:
+                    continue
+            return out
+        except Exception:
+            return []
+
+    # ------------------------------------------------------------------
+    # POINT 27 — TEACHER DASHBOARD (class codes)
+    # ------------------------------------------------------------------
+    def create_class_code(self, teacher_uid: str | int, class_name: str = "") -> str:
+        code = secrets.token_hex(3).upper()
+        if self.redis:
+            try:
+                self.redis.hset(f"class:{code}", mapping={
+                    "teacher_uid": str(teacher_uid),
+                    "class_name": class_name or "My Class",
+                    "created_at": _today_ist(),
+                })
+                self.redis.sadd(f"teacher:classes:{teacher_uid}", code)
+            except Exception as e:
+                logger.warning("create_class_code: %s", e)
+        return code
+
+    def join_class(self, uid: str | int, code: str) -> bool:
+        code = (code or "").strip().upper()
+        if not self.redis or not code:
+            return False
+        try:
+            if not self.redis.exists(f"class:{code}"):
+                return False
+            self.redis.sadd(f"class:{code}:students", str(uid))
+            user = self.get_user(uid) or self.ensure_user(uid)
+            user["class_code"] = code
+            self.save_user(uid, user)
+            return True
+        except Exception as e:
+            logger.warning("join_class: %s", e)
+            return False
+
+    def get_class_info(self, code: str) -> Optional[Dict]:
+        if not self.redis:
+            return None
+        try:
+            code = (code or "").strip().upper()
+            data = self.redis.hgetall(f"class:{code}")
+            if not data:
+                return None
+            student_ids = list(self.redis.smembers(f"class:{code}:students") or [])
+            students = []
+            for sid in student_ids:
+                u = self.get_user(sid) or {}
+                students.append({
+                    "uid": sid, "name": u.get("full_name", config.DEFAULT_STUDENT_NAMES["generic"]),
+                    "xp": int(u.get("xp", 0) or 0), "level": int(u.get("level", 1) or 1),
+                    "questions_asked": int(u.get("questions_asked", 0) or 0),
+                    "streak": int(u.get("streak", 0) or 0),
+                })
+            students.sort(key=lambda s: -s["xp"])
+            return {"code": code, **data, "students": students, "student_count": len(students)}
+        except Exception as e:
+            logger.warning("get_class_info: %s", e)
+            return None
+
+    def get_teacher_classes(self, teacher_uid: str | int) -> List[str]:
+        if not self.redis:
+            return []
+        try:
+            return list(self.redis.smembers(f"teacher:classes:{teacher_uid}") or [])
+        except Exception:
+            return []
+
+    # ------------------------------------------------------------------
+    # POINT 26 — PARENT PHONE + WEEKLY REPORT DATA
+    # ------------------------------------------------------------------
+    def set_parent_phone(self, uid: str | int, phone: str) -> bool:
+        user = self.get_user(uid) or self.ensure_user(uid)
+        user["parent_phone"] = (phone or "").strip()
+        return self.save_user(uid, user)
+
+    def get_weekly_report(self, uid: str | int) -> Dict[str, Any]:
+        user = self.get_user(uid) or {}
+        mistakes = self.get_mistakes(uid, limit=5)
+        rank = self.get_rank(uid)
+        return {
+            "name": user.get("full_name", config.DEFAULT_STUDENT_NAMES["generic"]),
+            "xp": int(user.get("xp", 0) or 0),
+            "level": int(user.get("level", 1) or 1),
+            "streak": int(user.get("streak", 0) or 0),
+            "questions_asked": int(user.get("questions_asked", 0) or 0),
+            "rank": rank,
+            "recent_weak_topics": [m.get("topic") or m.get("question", "")[:40] for m in mistakes],
+        }
+
+    # ------------------------------------------------------------------
+    # POINT 25 — REFERRAL LEADERBOARD ("Referral Raja")
+    # ------------------------------------------------------------------
+    def get_referral_leaderboard(self, limit: int = 10) -> List[Dict]:
+        if not self.redis:
+            return []
+        try:
+            uids = list(self.redis.smembers("stats:users") or [])
+            rows = []
+            for uid in uids:
+                u = self.get_user(uid)
+                if not u or self.is_test_user(uid, u):
+                    continue
+                count = int(u.get("referral_count", 0) or 0)
+                if count <= 0:
+                    continue
+                rows.append({"name": (u.get("full_name") or config.DEFAULT_STUDENT_NAMES["generic"])[:20], "referrals": count})
+            rows.sort(key=lambda r: -r["referrals"])
+            for i, r in enumerate(rows[:limit], 1):
+                r["rank"] = i
+            return rows[:limit]
+        except Exception:
+            return []
+
+    # ------------------------------------------------------------------
+    # POINT 30 — EXAM DATE (for the "exam bomb" 24h-before reminder)
+    # ------------------------------------------------------------------
+    def set_exam_date(self, uid: str | int, exam_date: str, subject: str = "") -> bool:
+        user = self.get_user(uid) or self.ensure_user(uid)
+        user["exam_date"] = (exam_date or "").strip()
+        user["exam_subject"] = (subject or "").strip()
+        return self.save_user(uid, user)
+
+    def get_users_with_exam_tomorrow(self) -> List[Dict]:
+        if not self.redis:
+            return []
+        try:
+            tomorrow = (_now_ist() + timedelta(days=1)).strftime(DATE_FORMAT)
+            out = []
+            for uid in self.redis.smembers("stats:users") or []:
+                u = self.get_user(uid)
+                if u and u.get("exam_date") == tomorrow:
+                    out.append({"uid": uid, **u})
+            return out
+        except Exception:
+            return []
+
+    # ------------------------------------------------------------------
+    # POINT 3/4/5 — SEMANTIC CACHE (theory only, never numerical).
+    # No vector DB available in this Redis-only stack, so we keep a
+    # capped pool of recent theory embeddings and do cosine similarity
+    # in Python. This is the light-weight equivalent of the pgvector
+    # design in the spec, sized for the free-tier user counts this app
+    # targets (a few thousand users) rather than a real vector index.
+    # ------------------------------------------------------------------
+    def semantic_cache_add(self, tool: str, question: str, embedding: List[float], answer: str) -> None:
+        if not self.redis or not embedding:
+            return
+        try:
+            entry_id = hashlib.sha256(f"{tool}|{question}".encode()).hexdigest()[:24]
+            payload = json.dumps({"q": question[:300], "vec": embedding, "ans": answer})
+            pool_key = f"semcache:{tool}"
+            pipe = self.redis.pipeline()
+            pipe.hset(pool_key, entry_id, payload)
+            pipe.expire(pool_key, config.CACHE_TTL * 6)
+            pipe.execute()
+            # Cap pool size so lookups stay cheap.
+            if self.redis.hlen(pool_key) > 800:
+                extra = self.redis.hkeys(pool_key)[:100]
+                if extra:
+                    self.redis.hdel(pool_key, *extra)
+        except Exception as e:
+            logger.warning("semantic_cache_add: %s", e)
+
+    def semantic_cache_search(self, tool: str, embedding: List[float], threshold: float = None) -> Optional[str]:
+        if not self.redis or not embedding:
+            return None
+        threshold = threshold if threshold is not None else config.SEMANTIC_CACHE_THRESHOLD
+        try:
+            pool_key = f"semcache:{tool}"
+            items = self.redis.hgetall(pool_key)
+            if not items:
+                return None
+            best_score, best_ans = 0.0, None
+            for raw in items.values():
+                try:
+                    data = json.loads(raw)
+                    vec = data.get("vec") or []
+                    score = _cosine_sim(embedding, vec)
+                    if score > best_score:
+                        best_score, best_ans = score, data.get("ans")
+                except Exception:
+                    continue
+            if best_ans and best_score >= threshold:
+                return best_ans
+            return None
+        except Exception as e:
+            logger.warning("semantic_cache_search: %s", e)
+            return None
+
+
+def _cosine_sim(a: List[float], b: List[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    try:
+        dot = sum(x * y for x, y in zip(a, b))
+        na = sum(x * x for x in a) ** 0.5
+        nb = sum(y * y for y in b) ** 0.5
+        if na == 0 or nb == 0:
+            return 0.0
+        return dot / (na * nb)
+    except Exception:
+        return 0.0
+
+
+# Keywords that mark a question as NUMERICAL (must always be solved fresh,
+# never served from cache — see POINT 5). Kept in config-like list here so
+# it's easy to extend without touching the detection logic.
+NUMERICAL_KEYWORDS = [
+    "solve", "calculate", "find", "nikalo", "value", "value of", "evaluate",
+    "compute", "derive the value", "simplify", "kitna hoga", "how much",
+    "what is the value", "=",
+]
+
+
+def is_numerical_question(text: str) -> bool:
+    """POINT 5: has a digit AND a solve/calculate-style keyword => numerical,
+    which must be solved fresh every time (never semantic-cached)."""
+    if not text:
+        return False
+    has_digit = any(ch.isdigit() for ch in text)
+    low = text.lower()
+    has_keyword = any(kw in low for kw in NUMERICAL_KEYWORDS)
+    return has_digit and has_keyword
+
+
+# JavaScript-style alias requested in the product spec.
+def isNumerical(text: str) -> bool:
+    return is_numerical_question(text)
+
+
+# ----------------------------------------------------------------------
+# POINT 3/19 — ABUSE DETECTION. Whole-word, case-insensitive match against
+# config.ABUSE_WORDS. Compiled once at import time; re-compiled if you ever
+# need to hot-reload the word list (not done automatically — restart the
+# process after changing ABUSE_WORDS env var).
+# ----------------------------------------------------------------------
+ABUSE_PAT = re.compile(
+    r"\b(" + "|".join(re.escape(w) for w in config.ABUSE_WORDS if w) + r")\b",
+    re.IGNORECASE,
+) if config.ABUSE_WORDS else None
+
+
+def contains_abuse(text: str) -> bool:
+    if not text or not ABUSE_PAT:
+        return False
+    return bool(ABUSE_PAT.search(text))
+
+
+def format_abuse_warning_message(warning_count: int, just_banned: bool) -> str:
+    """Shared Hindi warning/ban copy used by Telegram, WhatsApp, and web."""
+    if just_banned:
+        return (
+            f"🚫 *{config.ABUSE_BAN_HOURS} ghante ka ban laga diya gaya hai.*\n\n"
+            f"Teen warning ke baad bhi gaali-galoch nahi rukni chahiye thi. "
+            f"{config.ABUSE_BAN_HOURS} ghante baad wapas try karo, tab tak bhai\n"
+            f"ko break do 🙏\n\n- {config.BRAND_NAME}"
+        )
+    remaining = max(0, config.ABUSE_WARNING_LIMIT - warning_count)
+    return (
+        f"⚠️ *Warning {warning_count}/{config.ABUSE_WARNING_LIMIT}*\n\n"
+        f"Bhai, pyaar se baat karo — gaali-galoch yahan nahi chalega. "
+        f"{remaining} warning aur mili toh {config.ABUSE_BAN_HOURS} ghante ka ban lag jayega.\n\n"
+        "Chalo, ab apna doubt bolo 🙂"
+    )
+
+
+def format_ban_active_message(remaining_seconds: int) -> str:
+    hrs = max(1, remaining_seconds // 3600)
+    return (
+        f"🚫 Tumhara account abhi ~{hrs} ghante ke liye banned hai (abuse rule).\n\n"
+        f"Iske baad wapas normally use kar paoge. - {config.BRAND_NAME}"
+    )
+
 
 db = Database()
 _redis_for_rl = db.redis
@@ -918,7 +2113,7 @@ SOFT_FAIL_MSG = (
     "SaarthiBhai abhi thoda busy hai (free AI limits).\n"
     "15–20 second baad dubara try karo — answers wapas aa jaate hain.\n\n"
     "Short tip: chhota clear sawaal likho.\n"
-    "- Sparsh Singhal ka SaarthiBhai tumhare saath hai"
+    f"- {config.CREATOR_NAME} ka {config.SHORT_NAME} tumhare saath hai"
 )
 
 class AIService:
@@ -941,13 +2136,17 @@ class AIService:
         if self.openrouter_ready:
             logger.info("OpenRouter ready | %s", config.OPENROUTER_MODELS)
 
-    def _base_prompt(self, is_pro: bool) -> str:
-        base = (
-            "You are SaarthiBhai by Sparsh Singhal – India's fun gamified AI tutor for Class 6-12, "
-            "JEE, NEET, GATE, UPSC, SSC, Banking, CA, CUET, Olympiads, School Exams, College Exams, and many more. Reply in natural Hinglish. "
-            "Be clear, exam-oriented, encouraging, use emojis. Keep answers concise (prefer under ~250 words unless user asks for detail). "
-            "Use clean Markdown: headings, bold, bullet lists, and simple tables when helpful. ""For math use LaTeX in \\( ... \\) or $$ ... $$. Also add one plain-English line under hard formulas.\n\n"
+    def _base_prompt(self, is_pro: bool, language: str = "hinglish") -> str:
+        lang_key = (language or "hinglish").strip().lower()
+        lang_instruction = config.CONTENT.get("language_instructions", {}).get(
+            lang_key, config.CONTENT.get("language_instructions", {}).get("hinglish", "")
         )
+        template = config.CONTENT.get("ai_base_prompt_template", "{brand_name}. {language_instruction}")
+        base = template.format(
+            brand_name=config.BRAND_NAME,
+            language_instruction=lang_instruction,
+            style_intro=config.BRAND_STYLE_INTRO,
+        ) + "\n\n"
         if is_pro:
             base += "PRO user: give deeper explanations, tips, memory tricks, common mistakes, exam strategy.\n\n"
         return base
@@ -958,8 +2157,8 @@ class AIService:
         return {
             "general": (
                 f"{base}"
-                "Tool=GENERAL. Answer the student's question helpfully.\n"
-                "Do not force a special format unless asked.\n\n"
+                "Tool=GENERAL. Answer the student's question helpfully using the compact 10-in-1 structure when the request is academic/study related.\n"
+                "Do not fabricate PYQ claims, video links, citations, or data.\n\n"
                 f"Student:\n{question}"
             ),
             "explain": (
@@ -1053,7 +2252,7 @@ class AIService:
             ),
             "numerical": (
                 f"{base}"
-                "Tool=NUMERICAL only. Formula, substitution, final answer with units.\n\n"
+                "Tool=NUMERICAL only. This is always a fresh solve — never rely on a stored answer. Show EXACTLY 3 numbered steps: 1) Formula/setup, 2) Substitution/calculation, 3) Final answer with units/check. Box the final answer.\n\n"
                 f"Problem:\n{question}"
             ),
             "mcq": (
@@ -1165,6 +2364,46 @@ class AIService:
             logger.error("OpenAI-compatible call (%s): %s", model, e)
             return None
 
+    def _call_anthropic(self, prompt: str, max_tokens: int = 1500) -> Optional[str]:
+        if not config.ANTHROPIC_API_KEY:
+            return None
+        try:
+            r = requests.post(
+                config.URLS["anthropic_messages"],
+                headers={"x-api-key": config.ANTHROPIC_API_KEY, "anthropic-version": config.ANTHROPIC_API_VERSION, "content-type": "application/json"},
+                json={"model": config.ANTHROPIC_MODEL, "max_tokens": max_tokens, "system": "You are SaarthiBhai. Reply in the requested language and clean Markdown.", "messages":[{"role":"user","content":prompt}]},
+                timeout=20,
+            )
+            if r.status_code >= 400:
+                logger.warning("Claude HTTP %s: %s", r.status_code, r.text[:300]); return None
+            data = r.json()
+            parts = data.get("content") or []
+            text = "".join((p.get("text") or "") for p in parts if isinstance(p, dict)).strip()
+            return text or None
+        except Exception as e:
+            logger.warning("Claude: %s", e); return None
+
+    def _call_openai(self, prompt: str, max_tokens: int = 1500) -> Optional[str]:
+        return self._call_openai_compatible(config.URLS["openai_base_url"], config.OPENAI_API_KEY, config.OPENAI_MODEL, prompt, max_tokens) if config.OPENAI_API_KEY else None
+
+    def _call_xai(self, prompt: str, max_tokens: int = 1500) -> Optional[str]:
+        return self._call_openai_compatible(config.URLS["xai_base_url"], config.XAI_API_KEY, config.XAI_MODEL, prompt, max_tokens) if config.XAI_API_KEY else None
+
+    def _call_deepseek(self, prompt: str, max_tokens: int = 1500) -> Optional[str]:
+        return self._call_openai_compatible(config.URLS["deepseek_base_url"], config.DEEPSEEK_API_KEY, config.DEEPSEEK_MODEL, prompt, max_tokens) if config.DEEPSEEK_API_KEY else None
+
+    def _call_perplexity(self, prompt: str, max_tokens: int = 1500) -> Optional[str]:
+        return self._call_openai_compatible(config.URLS["perplexity_base_url"], config.PERPLEXITY_API_KEY, config.PERPLEXITY_MODEL, prompt, max_tokens) if config.PERPLEXITY_API_KEY else None
+
+    def _call_meta(self, prompt: str, max_tokens: int = 1500) -> Optional[str]:
+        return self._call_openai_compatible(config.META_BASE_URL, config.META_API_KEY, config.META_MODEL, prompt, max_tokens) if config.META_API_KEY else None
+
+    def _call_mistral(self, prompt: str, max_tokens: int = 1500) -> Optional[str]:
+        return self._call_openai_compatible(config.URLS["mistral_base_url"], config.MISTRAL_API_KEY, config.MISTRAL_MODEL, prompt, max_tokens) if config.MISTRAL_API_KEY else None
+
+    def _call_qwen(self, prompt: str, max_tokens: int = 1500) -> Optional[str]:
+        return self._call_openai_compatible(config.QWEN_BASE_URL, config.QWEN_API_KEY, config.QWEN_MODEL, prompt, max_tokens) if config.QWEN_API_KEY else None
+
     def _call_openrouter(self, prompt: str, max_tokens: int = 1500) -> Optional[str]:
         if not config.OPENROUTER_API_KEY or not config.OPENROUTER_MODELS:
             return None
@@ -1176,17 +2415,17 @@ class AIService:
         # model doesn't take the whole fallback chain down with it.
         for model in config.OPENROUTER_MODELS[:2]:  # only first 2 free models — faster fail
             text = self._call_openai_compatible(
-                "https://openrouter.ai/api/v1", config.OPENROUTER_API_KEY, model,
+                config.URLS["openrouter_base_url"], config.OPENROUTER_API_KEY, model,
                 prompt, max_tokens, extra_headers=headers,
             )
             if text:
                 return text
         return None
 
-    def answer(self, question: str, tool: str = "general", is_pro: bool = False) -> Optional[str]:
+    def answer(self, question: str, tool: str = "general", is_pro: bool = False, language: str = "hinglish") -> Optional[str]:
         if not question or not question.strip():
             return "Please ask a valid question."
-        base = self._base_prompt(is_pro)
+        base = self._base_prompt(is_pro, language=language)
         templates = self._templates(base, question.strip(), is_pro=is_pro)
         prompt = templates.get(tool, templates["general"])
         # Keep answers useful but shorter → much lower latency on free Gemini
@@ -1198,33 +2437,84 @@ class AIService:
             max_tokens = 900
         else:
             max_tokens = 700
-        # Primary Gemini Flash-Lite -> secondary OpenRouter (free). Optional Groq if AI_PRIMARY=groq. Each is skipped instantly if its key
-        # isn't configured, so this degrades gracefully to whatever subset
-        # of providers you've actually set up.
-        # Primary: Gemini Flash-Lite → Secondary: OpenRouter free models.
-        # Groq is optional last resort only if GROQ is forced via AI_PRIMARY=groq;
-        # default chain skips broken/slow Groq to cut latency.
-        providers = [
-            ("gemini_flash_lite", self._call_gemini_flash_lite),
-            ("openrouter", self._call_openrouter),
-        ]
-        if config.AI_PRIMARY == "groq" and self.groq_client:
-            providers = [("groq", self._call_groq)] + providers
-        # Retry the whole chain once more if every provider fails on the
-        # first pass (handles transient blips without giving up too soon).
-        # One fast pass only (no 1.2s sleep between retries — that added lag).
-        for name, fn in providers:
-            text = fn(prompt, max_tokens=max_tokens)
+        # Optional library RAG: NCERT/notes/open-book snippets stored in Supabase are
+        # injected only for knowledge-oriented tools. The retrieval is small so it
+        # does not turn every request into a giant context window.
+        if config.LIBRARY_CONTEXT_ENABLED and tool in ("general", "explain", "notes", "ncert", "pyq", "important") and supa.enabled:
+            try:
+                ex_tag, sub_tag = guess_exam_subject(question, exam_type, subject)
+                library_rows = db.search_library(question, ex_tag, sub_tag, limit=3)
+                if library_rows:
+                    snippets = []
+                    for row in library_rows:
+                        content = str(row.get("content") or "").strip()[:1800]
+                        if content:
+                            snippets.append(f"SOURCE: {row.get('title','Library')} [{row.get('source_type','reference')}]\n{content}")
+                    if snippets:
+                        prompt += "\n\nREFERENCE LIBRARY — use this material when relevant; do not invent citations:\n" + "\n---\n".join(snippets)
+            except Exception as e:
+                logger.debug("library context skipped: %s", e)
+
+        provider_fns = {
+            "gemini": self._call_gemini_flash_lite,
+            "gemini_flash_lite": self._call_gemini_flash_lite,
+            "groq": self._call_groq,
+            "openai": self._call_openai,
+            "xai": self._call_xai,
+            "deepseek": self._call_deepseek,
+            "claude": self._call_anthropic,
+            "anthropic": self._call_anthropic,
+            "perplexity": self._call_perplexity,
+            "meta": self._call_meta,
+            "mistral": self._call_mistral,
+            "qwen": self._call_qwen,
+            "openrouter": self._call_openrouter,
+        }
+        # Tool-aware routing keeps easy questions on fast providers and lets
+        # deeper/longer tools naturally fall through to stronger models.
+        order = list(config.AI_PROVIDER_ORDER)
+        if tool in ("solve", "numerical", "derivation"):
+            preferred = ["deepseek", "gemini", "claude", "openai", "groq", "openrouter"]
+            order = preferred + [x for x in order if x not in preferred]
+        elif tool in ("career", "youtube", "current_affairs"):
+            preferred = ["perplexity", "openai", "gemini", "xai", "claude", "openrouter"]
+            order = preferred + [x for x in order if x not in preferred]
+        elif tool in ("essay", "resume", "planner", "notes"):
+            preferred = ["claude", "openai", "gemini", "xai", "groq", "openrouter"]
+            order = preferred + [x for x in order if x not in preferred]
+
+        seen = set()
+        for name in order:
+            if name in seen or name not in provider_fns:
+                continue
+            seen.add(name)
+            fn = provider_fns[name]
+            # Skip unconfigured providers without making a network call.
+            configured = {
+                "gemini": bool(self.gemini_client), "gemini_flash_lite": bool(self.gemini_client),
+                "groq": bool(self.groq_client), "openai": bool(config.OPENAI_API_KEY),
+                "xai": bool(config.XAI_API_KEY), "deepseek": bool(config.DEEPSEEK_API_KEY),
+                "claude": bool(config.ANTHROPIC_API_KEY), "anthropic": bool(config.ANTHROPIC_API_KEY),
+                "perplexity": bool(config.PERPLEXITY_API_KEY), "meta": bool(config.META_API_KEY),
+                "mistral": bool(config.MISTRAL_API_KEY), "qwen": bool(config.QWEN_API_KEY),
+                "openrouter": bool(config.OPENROUTER_API_KEY),
+            }.get(name, False)
+            if not configured:
+                continue
+            try:
+                text = fn(prompt, max_tokens=max_tokens)
+            except Exception as e:
+                logger.warning("Provider %s crashed: %s", name, e); text = None
             if text:
                 logger.info("Answer served by provider: %s", name)
                 return text
         return SOFT_FAIL_MSG
 
 
-    def answer_with_image(self, img_bytes: bytes, mime: str, question: str = "", tool: str = "ocr", is_pro: bool = False) -> Optional[str]:
+    def answer_with_image(self, img_bytes: bytes, mime: str, question: str = "", tool: str = "ocr", is_pro: bool = False, language: str = "hinglish") -> Optional[str]:
         if not self.gemini_client:
             return SOFT_FAIL_MSG
-        base = self._base_prompt(is_pro)
+        base = self._base_prompt(is_pro, language=language)
         tool = (tool or "general").strip().lower()
         mime = mime or "image/jpeg"
         is_pdf = "pdf" in (mime or "").lower()
@@ -1291,20 +2581,156 @@ class AIService:
             logger.error("Vision: %s", e)
             return SOFT_FAIL_MSG
 
+    # ------------------------------------------------------------------
+    # POINT 3 — embeddings for the semantic theory-cache.
+    # ------------------------------------------------------------------
+    def embed_text(self, text: str) -> Optional[List[float]]:
+        if not self.gemini_client or not text or not text.strip():
+            return None
+        try:
+            resp = self.gemini_client.models.embed_content(
+                model=config.GEMINI_EMBED_MODEL,
+                contents=text.strip()[:2000],
+            )
+            emb = getattr(resp, "embeddings", None) or getattr(resp, "embedding", None)
+            if emb is None:
+                return None
+            if isinstance(emb, list) and emb and hasattr(emb[0], "values"):
+                return list(emb[0].values)
+            if hasattr(emb, "values"):
+                return list(emb.values)
+            if isinstance(emb, list):
+                return list(emb)
+            return None
+        except Exception as e:
+            logger.warning("embed_text: %s", e)
+            return None
+
+    # ------------------------------------------------------------------
+    # POINT 10 — QUIZ GENERATOR. Returns a structured quiz dict, built by
+    # asking the model for strict JSON (see structured_outputs guidance):
+    # {"questions": [{"q":..., "options":[...], "correct": idx, "explanation":...}]}
+    # Falls back gracefully to None on any parsing failure so the caller
+    # can show a friendly error instead of crashing.
+    # ------------------------------------------------------------------
+    def generate_quiz(self, topic: str, n_questions: int = 5, language: str = "hinglish",
+                       source_context: str = "") -> Optional[List[Dict[str, Any]]]:
+        lang_note = {
+            "hindi": "Likho pure Hindi (Devanagari) mein.",
+            "english": "Write in plain English.",
+        }.get(language, "Likho Hinglish mein (Hindi+English mix, Roman script).")
+        context_block = f"\nUse this student context (their weak topics / notes) if relevant:\n{source_context}\n" if source_context else ""
+        prompt = (
+            "You are SaarthiBhai's quiz generator. Output ONLY valid JSON, no markdown fences, "
+            "no preamble, no explanation outside the JSON.\n"
+            f"{lang_note}\n"
+            f"Generate exactly {n_questions} multiple-choice questions on: {topic}\n"
+            f"{context_block}"
+            "Each question needs 4 options, one correct index (0-based), a short explanation, "
+            "and a short HINT that nudges toward the answer WITHOUT stating it directly or naming "
+            "which option is correct.\n"
+            "JSON schema:\n"
+            '{"questions": [{"q": "string", "options": ["a","b","c","d"], "correct": 0, '
+            '"explanation": "string", "hint": "string"}]}\n'
+        )
+        raw = None
+        if self.gemini_client:
+            raw = self._call_gemini(prompt, max_tokens=1800)
+        if not raw:
+            raw = self._call_openrouter(prompt, max_tokens=1800)
+        if not raw:
+            return None
+        try:
+            cleaned = raw.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.strip("`")
+                cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned
+                if cleaned.lower().startswith("json"):
+                    cleaned = cleaned[4:]
+            start = cleaned.find("{")
+            end = cleaned.rfind("}")
+            if start == -1 or end == -1:
+                return None
+            data = json.loads(cleaned[start:end + 1])
+            questions = data.get("questions") or []
+            clean_qs = []
+            for q in questions:
+                if not q.get("q") or not q.get("options") or len(q.get("options", [])) < 2:
+                    continue
+                clean_qs.append({
+                    "q": str(q["q"])[:500],
+                    "options": [str(o)[:200] for o in q["options"]][:6],
+                    "correct": int(q.get("correct", 0)) if str(q.get("correct", 0)).isdigit() else 0,
+                    "explanation": str(q.get("explanation", ""))[:400],
+                    "hint": str(q.get("hint", ""))[:200],
+                })
+            return clean_qs or None
+        except Exception as e:
+            logger.warning("generate_quiz parse: %s", e)
+            return None
+
 
 ai = AIService()
 
 
-def get_ai_answer(question: str, tool: str, is_pro: bool) -> Optional[str]:
+# Tools where an answer legitimately varies with fresh working-out and must
+# never be served from cache (POINT 5: numerical freshness rule).
+_NEVER_CACHE_TOOLS = {"numerical", "solve", "derivation"}
+
+
+def get_ai_answer(question: str, tool: str, is_pro: bool, language: str = "hinglish",
+                  phone_number: str = "", exam_type: str = "", subject: str = "") -> Optional[str]:
     """Single entry point used by ALL surfaces (Telegram/WhatsApp/Web) so
-    caching is consistent everywhere instead of duplicated ad-hoc per route."""
-    ckey = make_cache_key(tool, question, is_pro)
-    cached = db.cache_get(ckey)
-    if cached:
-        return cached
-    text = run_ai(ai.answer, question, tool, is_pro=is_pro)
+    caching is consistent everywhere instead of duplicated ad-hoc per route.
+
+    Caching strategy (POINT 3/4/5):
+      - NUMERICAL questions (digit + solve/calculate keyword, or tool is
+        numerical/solve/derivation) are NEVER cached — solved fresh every time.
+      - THEORY questions first check the exact-match hash cache (fast,
+        free), then fall back to a semantic/embedding similarity cache
+        (catches reworded versions of the same question) before finally
+        calling the AI and writing back to both caches.
+      - Cache keys AND the semantic-cache pool are namespaced by language
+        so a Hindi-preference user never gets served an English-cached
+        answer (or vice versa) for the same underlying question.
+    """
+    language = (language or "hinglish").strip().lower()
+    numerical = tool in _NEVER_CACHE_TOOLS or is_numerical_question(question)
+    semantic_pool = f"{tool}:{language}"
+
+    if not numerical:
+        ckey = make_cache_key(tool, question, is_pro, language)
+        cached = db.cache_get(ckey)
+        if cached:
+            db.touch_master_cache(question, answer=cached, tool=tool, source="redis_hit", phone_number=phone_number, exam_type=exam_type, subject=subject)
+            return cached
+        durable = db.get_master_cache(question, tool=tool, exam_type=exam_type, subject=subject, phone_number=phone_number)
+        if durable and durable.get("answer"):
+            db.cache_set(ckey, durable["answer"])
+            return durable["answer"]
+        try:
+            emb = ai.embed_text(question)
+            if emb:
+                sem_hit = db.semantic_cache_search(semantic_pool, emb)
+                if sem_hit:
+                    db.cache_set(ckey, sem_hit)
+                    db.touch_master_cache(question, answer=sem_hit, tool=tool, source="semantic_hit", phone_number=phone_number, exam_type=exam_type, subject=subject)
+                    return sem_hit
+        except Exception as e:
+            logger.warning("semantic cache lookup skipped: %s", e)
+
+    text = run_ai(ai.answer, question, tool, is_pro=is_pro, language=language)
     if text and not str(text).startswith("ERROR:"):
-        db.cache_set(ckey, text)
+        if not numerical:
+            ckey = make_cache_key(tool, question, is_pro, language)
+            db.cache_set(ckey, text)
+            db.touch_master_cache(question, answer=text, tool=tool, source="ai", phone_number=phone_number, exam_type=exam_type, subject=subject)
+            try:
+                emb = ai.embed_text(question)
+                if emb:
+                    db.semantic_cache_add(semantic_pool, question, emb, text)
+            except Exception as e:
+                logger.warning("semantic cache write skipped: %s", e)
         return text
     return None
 
@@ -1341,13 +2767,16 @@ def main_menu(is_pro: bool = False) -> InlineKeyboardMarkup:
          InlineKeyboardButton("🛠 Tools", callback_data="menu_tools")],
         [InlineKeyboardButton("📊 Progress", callback_data="menu_progress"),
          InlineKeyboardButton("🏆 Leaderboard", callback_data="menu_lb")],
-        [InlineKeyboardButton("🔥 Streak", callback_data="menu_streak")],
+        [InlineKeyboardButton("🔥 Streak", callback_data="menu_streak"),
+         InlineKeyboardButton("📖 Galti Diary", callback_data="menu_galti")],
+        [InlineKeyboardButton("❓ Quiz (type /quiz topic)", callback_data="menu_quiz_hint"),
+         InlineKeyboardButton("🌐 Language", callback_data="menu_lang")],
     ]
     if is_pro:
         rows.append([InlineKeyboardButton("👑 You are PRO", callback_data="menu_prostatus")])
     else:
         rows.append([InlineKeyboardButton(f"💎 Upgrade ₹{config.PRO_PRICE_INR}", callback_data="menu_upgrade")])
-    rows.append([InlineKeyboardButton("👨‍💻 About Sparsh Singhal", callback_data="menu_about")])
+    rows.append([InlineKeyboardButton(f"👨‍💻 About {config.CREATOR_NAME}", callback_data="menu_about")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1379,23 +2808,8 @@ def tools_menu(is_pro: bool = False) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-PRO_ONLY_TOOLS = {"roast", "ncert", "mindmap", "important", "diagram", "derivation", "numerical",
-                   "mcq", "essay", "resume", "youtube", "career", "tips", "mock"}
-
-# Keyword prefixes used to auto-detect which tool the user meant when they
-# just type free text instead of picking from a menu — shared by Telegram
-# and WhatsApp so both surfaces behave identically instead of WhatsApp only
-# ever running "general". Every PRO_ONLY_TOOLS entry needs a prefix here too,
-# otherwise typing the tool name is the ONLY way in and some tools become
-# unreachable if the corresponding menu button is ever missed.
-TOOL_KEYWORDS = [
-    ("explain", "explain"), ("solve", "solve"), ("notes", "notes"), ("pyq", "pyq"),
-    ("formula", "formula"), ("plan", "planner"), ("mock", "mock"), ("roast", "roast"),
-    ("mindmap", "mindmap"), ("mcq", "mcq"), ("essay", "essay"), ("resume", "resume"),
-    ("career", "career"), ("tips", "tips"), ("ncert", "ncert"), ("derivation", "derivation"),
-    ("derive", "derivation"), ("numerical", "numerical"), ("important", "important"),
-    ("diagram", "diagram"), ("youtube", "youtube"),
-]
+PRO_ONLY_TOOLS = set(config.PRO_ONLY_TOOLS)
+TOOL_KEYWORDS = list(config.TOOL_KEYWORDS)
 
 
 def detect_tool_from_text(text: str, default: str = "general") -> str:
@@ -1411,6 +2825,13 @@ async def process_question(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     if not user:
         return
     uid = user.id
+    if db.is_banned(uid):
+        await reply(update, format_ban_active_message(db.get_ban_remaining_seconds(uid)))
+        return
+    if contains_abuse(text):
+        count, just_banned = db.record_abuse_warning(uid)
+        await reply(update, format_abuse_warning_message(count, just_banned))
+        return
     is_pro = db.is_pro(uid)
     db.track_activity(uid)
     if tool in PRO_ONLY_TOOLS and not is_pro:
@@ -1424,13 +2845,21 @@ async def process_question(update: Update, context: ContextTypes.DEFAULT_TYPE, t
             return
     await typing(update)
     start = time.time()
-    answer = get_ai_answer(text, tool, is_pro)
+    udata_for_ai = db.get_user(uid) or {}
+    answer = get_ai_answer(text, tool, is_pro, language=db.get_language(uid),
+                           phone_number=udata_for_ai.get("phone_number", ""),
+                           exam_type=udata_for_ai.get("exam_type", ""), subject=udata_for_ai.get("subject", ""))
     elapsed = time.time() - start
     if not answer:
         await reply(update, "😔 Answer generate nahi ho paya abhi. Please dobara try karo 30 seconds baad.")
         return
-    udata = db.ensure_user(uid, user.username or "", user.full_name or "Student")
-    xp_gain = config.XP_QUESTION * (2 if is_pro else 1)
+    udata = db.ensure_user(uid, user.username or "", user.full_name or config.DEFAULT_STUDENT_NAMES["generic"])
+    ex, sub = guess_exam_subject(text, udata.get("exam_type", ""), udata.get("subject", ""))
+    udata["exam_type"], udata["subject"], udata["last_question_at"] = ex, sub, _now_ist().isoformat()
+    db.save_user(uid, udata)
+    db.sync_user_to_supabase(uid, udata)
+    db.add_personal_history(uid, text, tool=tool, exam_type=ex, subject=sub, source_cache="")
+    xp_gain = config.XP_QUESTION * (config.PRO_XP_MULTIPLIER if is_pro else 1)
     xp, level = db.add_xp(uid, xp_gain)
     try:
         if db.redis:
@@ -1439,8 +2868,9 @@ async def process_question(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     except Exception:
         pass
     db.update_streak(uid)
-    footer = f"\n\n━━━━━━━━━━━━━━━\n⚡ {elapsed:.1f}s | ⭐ +{xp_gain} XP{' (2× Pro)' if is_pro else ''} | Level {level}\n_ - made with love by Sparsh Singhal _"
-    full = answer + footer
+    db.sync_user_to_supabase(uid)
+    footer = f"\n\n━━━━━━━━━━━━━━━\n⚡ {elapsed:.1f}s | ⭐ +{xp_gain} XP{f' (Pro ×{config.PRO_XP_MULTIPLIER})' if is_pro else ''} | Level {level}\n" + config.CONTENT["footer_signature"].format(creator_name=config.CREATOR_NAME)
+    full = answer + footer + _channel_resource_suffix(text, is_pro, uid)
     if len(full) <= 4096:
         await reply(update, full)
     else:
@@ -1460,13 +2890,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         arg0 = context.args[0]
         if arg0.startswith("ref_"):
             ref_code = arg0[4:]
-    udata = db.ensure_user(user.id, user.username or "", user.full_name or "Student", referred_by=ref_code)
+    udata = db.ensure_user(user.id, user.username or "", user.full_name or config.DEFAULT_STUDENT_NAMES["generic"], referred_by=ref_code)
     db.register_referral_code(user.id, udata.get("referral_code", ""))
     db.track_activity(user.id)
     bonus_note = "\n\n🎁 Referral bonus applied!" if ref_code else ""
-    await reply(update,
-                f"🎓 *Welcome to SaarthiBhai!*\n\nHi {user.first_name}! Type your doubt or use menu.{bonus_note}\n\n_ - made with love by Sparsh Singhal _",
-                main_menu(db.is_pro(user.id)))
+    welcome_text = (
+        f"🎓 *Welcome to {config.BRAND_NAME}!*\n\nHi {user.first_name}! Type your doubt or use menu.{bonus_note}\n\n"
+        "Bonus commands:\n"
+        "`/quiz <topic>` — instant quiz\n"
+        "`/galti` — your mistake diary\n"
+        "`/language` — Hindi/Hinglish/English\n"
+        "`/joinclass <code>` — join a teacher's class\n\n"
+        + config.CONTENT["footer_signature"].format(creator_name=config.CREATOR_NAME)
+    )
+    await reply(update, welcome_text, main_menu(db.is_pro(user.id)))
 
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1494,7 +2931,8 @@ async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     u = db.ensure_user(user.id)
     xp = int(u.get("xp", 0))
     level = int(u.get("level", 1))
-    await reply(update, f"📊 *Progress*\n\n⭐ Level {level}\nXP: {xp}\n🔥 Streak: {u.get('streak', 0)}\n📚 Questions: {u.get('questions_asked', 0)}")
+    coins = db.get_coins(user.id)
+    await reply(update, f"📊 *Progress*\n\n⭐ Level {level}\nXP: {xp}\n🪙 Coins: {coins}\n🔥 Streak: {u.get('streak', 0)}\n📚 Questions: {u.get('questions_asked', 0)}")
 
 
 async def streak_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1523,8 +2961,8 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     uid = user.id if user else 0
-    domain = config.VERCEL_URL.rstrip("/") if config.VERCEL_URL else "studygenie-by-sparsh-singhal.onrender.com"
-    link = f"https://{domain}/pay?uid={uid}"
+    domain = config.VERCEL_URL.rstrip("/") if config.VERCEL_URL else config.PUBLIC_DOMAIN
+    link = f"{config.PUBLIC_SCHEME}://{domain}/pay?uid={uid}"
     await reply(update,
                 f"💎 *SaarthiBhai Pro – ₹{config.PRO_PRICE_INR}/30 days*\n\n"
                 "Unlimited • Roast • Mindmap • OCR • 2× XP\n\n"
@@ -1533,6 +2971,119 @@ async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def about_sparsh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await reply(update, "👨‍💻 *Sparsh Singhal*\n\nCreator & Developer of SaarthiBhai 🎓\nBuilt with ❤️ for Indian students — gamified learning for every exam.\n\n_SaarthiBhai — by Sparsh Singhal_")
+
+
+# ----------------------------------------------------------------------
+# QUIZ over Telegram — one question at a time via inline buttons.
+# State (quiz_id, current index, answers-so-far) lives in Redis so it
+# survives across the async callback round-trips.
+# ----------------------------------------------------------------------
+def _quiz_state_key(uid) -> str:
+    return f"tgquiz:{uid}"
+
+
+def _save_quiz_state(uid, quiz_id: str, idx: int, answers: List[int]) -> None:
+    if db.redis:
+        try:
+            db.redis.setex(_quiz_state_key(uid), 3600, json.dumps({"quiz_id": quiz_id, "idx": idx, "answers": answers}))
+        except Exception:
+            pass
+
+
+def _load_quiz_state(uid) -> Optional[Dict]:
+    if not db.redis:
+        return None
+    try:
+        raw = db.redis.get(_quiz_state_key(uid))
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+
+def _quiz_option_keyboard(quiz_id: str, options: List[str]) -> InlineKeyboardMarkup:
+    letters = ["A", "B", "C", "D", "E", "F"]
+    rows = [[InlineKeyboardButton(f"{letters[i]}. {opt[:40]}", callback_data=f"qz_{quiz_id}_{i}")]
+            for i, opt in enumerate(options)]
+    return InlineKeyboardMarkup(rows)
+
+
+async def _send_quiz_question(update: Update, quiz: Dict, idx: int) -> None:
+    q = quiz["questions"][idx]
+    text = f"❓ *Q{idx + 1}/{len(quiz['questions'])}:* {q['q']}"
+    await reply(update, text, _quiz_option_keyboard(quiz["quiz_id"], q["options"]))
+
+
+async def quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    uid = user.id
+    topic = " ".join(context.args) if context.args else ""
+    if not topic:
+        await reply(update, "📚 Usage: `/quiz <topic>`\nExample: `/quiz Thermodynamics`")
+        return
+    is_pro = db.is_pro(uid)
+    if not is_pro and db.get_daily_quiz_used(uid):
+        await reply(update, "❌ Free daily quiz limit khatam. Pro se unlimited quiz milta hai.",
+                    InlineKeyboardMarkup([[InlineKeyboardButton("💎 Upgrade", callback_data="menu_upgrade")]]))
+        return
+    await typing(update)
+    n = 10 if is_pro else 3
+    questions = run_ai(ai.generate_quiz, topic, n_questions=n, language=db.get_language(uid))
+    if not questions:
+        await reply(update, "😔 Quiz generate nahi ho paya. Dobara try karo.")
+        return
+    quiz_id = secrets.token_hex(8)
+    quiz_data = {"quiz_id": quiz_id, "owner_uid": str(uid), "topic": topic, "questions": questions}
+    db.save_quiz(quiz_id, quiz_data)
+    if not is_pro:
+        db.mark_daily_quiz_used(uid)
+    _save_quiz_state(uid, quiz_id, 0, [])
+    await reply(update, f"🎯 *Quiz Started:* {topic} ({len(questions)} Qs)")
+    await _send_quiz_question(update, quiz_data, 0)
+
+
+async def galti_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    mistakes = db.get_mistakes(user.id, limit=10)
+    if not mistakes:
+        await reply(update, "📖 *Galti Diary khaali hai!* Koi mistake save nahi hui abhi tak — solid going 🔥")
+        return
+    lines = ["📖 *Teri Galti Diary (last 10):*\n"]
+    for i, m in enumerate(mistakes, 1):
+        lines.append(f"{i}. {m.get('question','')[:80]}\n   ✅ {m.get('correct_answer','')[:60]}")
+    await reply(update, "\n".join(lines))
+
+
+async def language_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    if context.args:
+        lang = context.args[0].strip().lower()
+        db.set_language(user.id, lang)
+        await reply(update, f"✅ Language set: *{db.get_language(user.id)}*")
+        return
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🇮🇳 Hindi", callback_data="lang_hindi"),
+         InlineKeyboardButton("🔤 Hinglish", callback_data="lang_hinglish"),
+         InlineKeyboardButton("🇬🇧 English", callback_data="lang_english")],
+    ])
+    await reply(update, "🌐 Kaunsi bhasha me samjhau?", kb)
+
+
+async def joinclass_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    if not context.args:
+        await reply(update, "🏫 Usage: `/joinclass <CODE>`")
+        return
+    code = context.args[0].strip().upper()
+    ok = db.join_class(user.id, code)
+    await reply(update, "✅ Class join ho gaya!" if ok else "❌ Invalid class code.")
 
 
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1562,6 +3113,12 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await about_sparsh(update, context)
     elif data == "menu_prostatus":
         await reply(update, "👑 You are PRO. Enjoy unlimited power!")
+    elif data == "menu_galti":
+        await galti_cmd(update, context)
+    elif data == "menu_quiz_hint":
+        await reply(update, "❓ Type `/quiz <topic>` to start — example: `/quiz Newton's Laws`")
+    elif data == "menu_lang":
+        await language_cmd(update, context)
     elif data.startswith("tool_"):
         tool = data.replace("tool_", "")
         if tool in PRO_ONLY_TOOLS and not is_pro:
@@ -1570,6 +3127,71 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         db.set_tool(uid, tool)
         await reply(update, f"✅ Tool: *{tool}*\nAb sawaal type karo.")
+    elif data.startswith("lang_"):
+        lang = data.replace("lang_", "")
+        db.set_language(uid, lang)
+        await reply(update, f"✅ Language set: *{db.get_language(uid)}*")
+    elif data.startswith("qz_"):
+        # qz_{quiz_id}_{option_index}
+        try:
+            _, quiz_id, opt_str = data.split("_", 2)
+            picked = int(opt_str)
+        except Exception:
+            return
+        quiz = db.get_quiz(quiz_id)
+        state = _load_quiz_state(uid)
+        if not quiz or not state or state.get("quiz_id") != quiz_id:
+            await reply(update, "⏱️ Quiz session expired. Start again with /quiz <topic>.")
+            return
+        idx = state.get("idx", 0)
+        answers = state.get("answers", [])
+        answers.append(picked)
+        q = quiz["questions"][idx]
+        correct_idx = q.get("correct", 0)
+        is_correct = (picked == correct_idx)
+        if not is_correct:
+            mistake_coins = db.add_mistake(uid, question=q.get("q", ""), tool="quiz",
+                            correct_answer=(q.get("options") or [""])[correct_idx] if correct_idx < len(q.get("options", [])) else "",
+                            user_answer=(q.get("options") or [""])[picked] if 0 <= picked < len(q.get("options", [])) else "?",
+                            topic=quiz.get("topic", ""))
+        else:
+            mistake_coins = 0
+        verdict = "✅ Sahi!" if is_correct else f"❌ Galat. Himmat ki koshish — Galti Diary me daal di 📖 +{mistake_coins} 🪙"
+        explanation = q.get("explanation", "")
+        await reply(update, f"{verdict}\n\n{explanation}" if explanation else verdict)
+        next_idx = idx + 1
+        if next_idx >= len(quiz["questions"]):
+            score = sum(1 for i, a in enumerate(answers) if a == quiz["questions"][i].get("correct", 0))
+            total = len(quiz["questions"])
+            db.save_quiz_attempt(uid, quiz_id, score, total, topic=quiz.get("topic", ""), mode="telegram")
+            xp_gain = 100 if score == total else int(20 * (score / total)) if total else 0
+            coins_gain = config.QUIZ_PERFECT_COINS if score == total else int(10 * (score / total)) if total else 0
+            if xp_gain:
+                db.add_xp(uid, xp_gain)
+            if coins_gain:
+                db.add_coins(uid, coins_gain)
+            if db.redis:
+                try:
+                    db.redis.delete(_quiz_state_key(uid))
+                except Exception:
+                    pass
+            await reply(update, f"🏁 *Quiz Khatam!* Score: {score}/{total}\n⭐ +{xp_gain} XP | 🪙 +{coins_gain} Coins\n\nUse /quiz <topic> for another round.")
+        else:
+            _save_quiz_state(uid, quiz_id, next_idx, answers)
+            await _send_quiz_question(update, quiz, next_idx)
+
+
+async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Optional phone-link step so Telegram accounts can become phone-keyed in Supabase."""
+    user = update.effective_user
+    contact = update.effective_message.contact if update.effective_message else None
+    if not user or not contact:
+        return
+    if str(contact.user_id or "") and int(contact.user_id) != int(user.id):
+        await reply(update, "⚠️ Apna hi contact share karo, bhai.")
+        return
+    ok = db.set_phone_number(user.id, contact.phone_number or "")
+    await reply(update, "✅ Phone link ho gaya. Ab tumhara Supabase profile phone number ko ID maan kar save hoga." if ok else "❌ Phone number save nahi ho paya.")
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1594,7 +3216,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if not answer:
             await reply(update, "😔 Could not read image.")
             return
-        udata = db.ensure_user(uid, user.username or "", user.full_name or "Student")
+        udata = db.ensure_user(uid, user.username or "", user.full_name or config.DEFAULT_STUDENT_NAMES["generic"])
         xp_gain = config.XP_QUESTION * 2
         xp, level = db.add_xp(uid, xp_gain)
         try:
@@ -1637,7 +3259,12 @@ async def get_app() -> Application:
         app_.add_handler(CommandHandler("leaderboard", leaderboard))
         app_.add_handler(CommandHandler("upgrade", upgrade))
         app_.add_handler(CommandHandler("about", about_sparsh))
+        app_.add_handler(CommandHandler("quiz", quiz_cmd))
+        app_.add_handler(CommandHandler("galti", galti_cmd))
+        app_.add_handler(CommandHandler("language", language_cmd))
+        app_.add_handler(CommandHandler("joinclass", joinclass_cmd))
         app_.add_handler(CallbackQueryHandler(callback))
+        app_.add_handler(MessageHandler(filters.CONTACT, handle_contact))
         app_.add_handler(MessageHandler(filters.PHOTO, handle_photo))
         app_.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text))
         app_.add_error_handler(error_handler)
@@ -1648,7 +3275,14 @@ async def get_app() -> Application:
 
 def process_whatsapp_message(from_number: str, text: str, profile_name: str = "") -> None:
     uid = f"wa:{from_number}"
-    db.ensure_user(uid, full_name=profile_name or "WhatsApp Student", platform="whatsapp")
+    if db.is_banned(uid):
+        _send_whatsapp_text(from_number, format_ban_active_message(db.get_ban_remaining_seconds(uid)))
+        return
+    if contains_abuse(text):
+        count, just_banned = db.record_abuse_warning(uid)
+        _send_whatsapp_text(from_number, format_abuse_warning_message(count, just_banned))
+        return
+    db.ensure_user(uid, full_name=profile_name or "WhatsApp Student", platform="whatsapp", phone_number=from_number)
     db.track_activity(uid)
     is_pro = db.is_pro(uid)
     tool = detect_tool_from_text(text)
@@ -1660,26 +3294,39 @@ def process_whatsapp_message(from_number: str, text: str, profile_name: str = ""
         if not can:
             _send_whatsapp_text(from_number, f"❌ Free quota finished!\nDaily: {quota['daily_left']} | Lifetime: {quota['lifetime_left']}\n\nUpgrade for unlimited access 💎")
             return
-    answer = get_ai_answer(text, tool, is_pro)
+    udata_for_ai = db.get_user(uid) or {}
+    answer = get_ai_answer(text, tool, is_pro, language=db.get_language(uid),
+                           phone_number=udata_for_ai.get("phone_number", from_number),
+                           exam_type=udata_for_ai.get("exam_type", ""), subject=udata_for_ai.get("subject", ""))
     if not answer:
         _send_whatsapp_text(from_number, "😔 Abhi answer generate nahi ho paya. Please 30 second baad dobara try karo.")
         return
     db.update_streak(uid)
-    xp, level = db.add_xp(uid, config.XP_QUESTION * (2 if is_pro else 1))
+    ex, sub = guess_exam_subject(text, (db.get_user(uid) or {}).get("exam_type", ""), (db.get_user(uid) or {}).get("subject", ""))
+    u = db.get_user(uid) or {}
+    u["exam_type"], u["subject"], u["last_question_at"] = ex, sub, _now_ist().isoformat()
+    db.save_user(uid, u); db.sync_user_to_supabase(uid, u)
+    db.add_personal_history(uid, text, tool=tool, exam_type=ex, subject=sub)
+    try:
+        schedule_spaced_reminders(uid, text, tool)
+    except Exception:
+        pass
+    xp, level = db.add_xp(uid, config.XP_QUESTION * (config.PRO_XP_MULTIPLIER if is_pro else 1))
     if db.redis:
         try:
             db.redis.hincrby(db._key(uid), "questions_asked", 1)
             db.redis.incr("stats:total_questions")
         except Exception:
             pass
-    footer = f"\n\n━━━━━━━━━━━━━━━\n⭐ +{config.XP_QUESTION * (2 if is_pro else 1)} XP{' (2× Pro)' if is_pro else ''} | Level {level}\n- made with love by Sparsh Singhal"
-    _send_whatsapp_text(from_number, answer + footer)
+    db.sync_user_to_supabase(uid)
+    footer = f"\n\n━━━━━━━━━━━━━━━\n⭐ +{config.XP_QUESTION * config.PRO_XP_MULTIPLIER if is_pro else config.XP_QUESTION} XP" + (f" (Pro ×{config.PRO_XP_MULTIPLIER})" if is_pro else "") + f" | Level {level}\n" + config.CONTENT["footer_signature"].format(creator_name=config.CREATOR_NAME)
+    _send_whatsapp_text(from_number, answer + footer + _channel_resource_suffix(text, is_pro, uid))
 
 
 def _send_whatsapp_text(to_number: str, body: str) -> None:
     if config.WHATSAPP_TOKEN and config.WHATSAPP_PHONE_NUMBER_ID:
         try:
-            url = f"https://graph.facebook.com/{config.WHATSAPP_API_VERSION}/{config.WHATSAPP_PHONE_NUMBER_ID}/messages"
+            url = f"{config.URLS["whatsapp_graph_base_url"]}/{config.WHATSAPP_API_VERSION}/{config.WHATSAPP_PHONE_NUMBER_ID}/messages"
             headers = {"Authorization": f"Bearer {config.WHATSAPP_TOKEN}", "Content-Type": "application/json"}
             requests.post(url, json={"messaging_product": "whatsapp", "to": to_number, "type": "text",
                                      "text": {"body": body[:4000]}}, headers=headers, timeout=15)
@@ -1695,28 +3342,28 @@ FRONTEND_HTML = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" crossorigin="anonymous">
-<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js" crossorigin="anonymous"></script>
-<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="{{ katex_css }}" crossorigin="anonymous">
+<script src="{{ katex_js }}" crossorigin="anonymous"></script>
+<script src="{{ katex_auto_render_js }}" crossorigin="anonymous"></script>
 
 <meta charset="UTF-8">
 <link rel="icon" type="image/svg+xml" href="/bot-icon.svg">
 <link rel="apple-touch-icon" href="/bot-icon.svg">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SaarthiBhai by Sparsh Singhal</title>
-<meta name="description" content="SaarthiBhai — India's gamified AI tutor, built by Sparsh Singhal.">
+<title>{{ brand_name }}</title>
+<meta name="description" content="{{ brand_name }} — gamified AI tutor, built by {{ creator_name }}.">
 <style>
-:root{--bg:#0b1220;--card:#111827;--accent:#22d3ee;--text:#f1f5f9;--muted:#94a3b8;--border:rgba(255,255,255,0.08)}
+:root{--bg:#ffffff;--card:#ffffff;--accent:{{ theme_primary }};--text:#111111;--muted:#575757;--border:rgba(17,17,17,.12)}
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;flex-direction:column}
-header{background:linear-gradient(90deg,#0f172a,#1e1b4b);padding:.85rem 1.25rem;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border);position:sticky;top:0;z-index:50}
+header{background:var(--accent);padding:.85rem 1.25rem;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border);position:sticky;top:0;z-index:50}
 .logo-wrap{display:flex;align-items:center;gap:.65rem;cursor:pointer;user-select:none}
 .logo-wrap img{width:52px;height:52px;border-radius:50%;object-fit:cover;border:2px solid var(--accent);box-shadow:0 0 0 3px rgba(34,211,238,.25)}
 .logo{font-size:1.25rem;font-weight:700}.logo span{color:var(--accent)}
 .brand-sub{font-size:.7rem;color:var(--muted);margin-top:1px}
 .stats{font-size:.82rem;color:var(--muted);display:flex;gap:1rem;align-items:center;flex-wrap:wrap}
-.pro-btn-top{background:linear-gradient(90deg,#a78bfa,#ec4899);color:#fff;border:none;border-radius:999px;padding:.35rem .85rem;font-size:.78rem;font-weight:700;cursor:pointer}
+.pro-btn-top{background:var(--accent);color:#111;border:2px solid #111;border-radius:999px;padding:.35rem .85rem;font-size:.78rem;font-weight:700;cursor:pointer}
 main{flex:1;display:grid;grid-template-columns:280px 1fr;max-width:1400px;margin:0 auto;width:100%}
 @media(max-width:900px){
   main{grid-template-columns:1fr;max-width:100%}
@@ -1754,9 +3401,9 @@ main{flex:1;display:grid;grid-template-columns:280px 1fr;max-width:1400px;margin
 .sidebar{background:var(--card);border-right:1px solid var(--border);padding:1.25rem 1rem;overflow-y:auto}
 .sidebar h3{font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:1rem 0 .6rem}
 .tool-btn{display:block;width:100%;text-align:left;background:transparent;border:1px solid transparent;color:var(--text);padding:.55rem .8rem;border-radius:8px;margin-bottom:.25rem;cursor:pointer;font-size:.92rem}
-.tool-btn:hover,.tool-btn.active{background:rgba(34,211,238,.12);border-color:var(--accent);color:var(--accent)}
-.pro-badge{background:linear-gradient(90deg,#a78bfa,#ec4899);color:#fff;font-size:.65rem;padding:.12rem .4rem;border-radius:999px;margin-left:.35rem}
-.pay-side{display:block;width:100%;margin:1rem 0 .5rem;background:linear-gradient(90deg,#a78bfa,#ec4899);color:#fff;border:none;border-radius:10px;padding:.7rem;font-weight:700;cursor:pointer;font-size:.9rem}
+.tool-btn:hover,.tool-btn.active{background:rgba(255,214,0,.22);border-color:#111;color:#111}
+.pro-badge{background:var(--accent);color:#111;border:1px solid #111;font-size:.65rem;padding:.12rem .4rem;border-radius:999px;margin-left:.35rem}
+.pay-side{display:block;width:100%;margin:1rem 0 .5rem;background:var(--accent);color:#111;border:2px solid #111;border-radius:10px;padding:.7rem;font-weight:700;cursor:pointer;font-size:.9rem}
 .creator-card{display:flex;gap:.7rem;align-items:center;padding:.75rem;background:#0f172a;border-radius:12px;border:1px solid var(--border);margin-bottom:1rem}
 .creator-card img{width:84px;height:84px;border-radius:50%;object-fit:cover;border:3px solid var(--accent);box-shadow:0 0 0 4px rgba(34,211,238,.22)}
 .creator-card .name{font-weight:700;font-size:.9rem}
@@ -1764,9 +3411,9 @@ main{flex:1;display:grid;grid-template-columns:280px 1fr;max-width:1400px;margin
 .chat-area{display:flex;flex-direction:column;height:calc(100vh - 64px)}
 .messages{flex:1;overflow-y:auto;padding:1.25rem;display:flex;flex-direction:column;gap:1rem}
 .msg{max-width:88%;padding:.95rem 1.1rem;border-radius:16px;line-height:1.6;word-break:break-word}
-.msg.user{align-self:flex-end;background:linear-gradient(135deg,#0891b2,#0e7490);border-bottom-right-radius:4px;white-space:pre-wrap}
-.msg.bot{align-self:flex-start;background:var(--card);border:1px solid var(--border);border-bottom-left-radius:4px}
-.msg.bot h1,.msg.bot h2,.msg.bot h3,.msg.bot h4{color:#f1f5f9;margin:.7rem 0 .35rem;line-height:1.3}
+.msg.user{align-self:flex-end;background:#fff;color:#111;border:1px solid #111;border-bottom-right-radius:4px;white-space:pre-wrap}
+.msg.bot{align-self:flex-start;background:var(--accent);color:#111;border:1px solid #111;border-bottom-left-radius:4px}
+.msg.bot h1,.msg.bot h2,.msg.bot h3,.msg.bot h4{color:#111;margin:.7rem 0 .35rem;line-height:1.3}
 .msg.bot h1{font-size:1.2rem}.msg.bot h2{font-size:1.1rem}.msg.bot h3{font-size:1.02rem}
 .msg.bot p{margin:.35rem 0}
 .msg.bot ul,.msg.bot ol{margin:.4rem 0 .4rem 1.25rem}
@@ -1781,7 +3428,7 @@ main{flex:1;display:grid;grid-template-columns:280px 1fr;max-width:1400px;margin
 .input-area{padding:1rem 1.25rem 1.25rem;background:var(--card);border-top:1px solid var(--border)}
 .input-row{display:flex;gap:.65rem;align-items:flex-end}
 textarea{flex:1;background:#0f172a;border:1px solid var(--border);border-radius:12px;color:var(--text);padding:.85rem 1rem;resize:none;font-size:1rem;min-height:48px;outline:none}
-button.send{background:var(--accent);color:#0b1220;border:none;border-radius:12px;padding:0 1.25rem;height:48px;font-weight:700;cursor:pointer}
+button.send{background:var(--accent);color:#111111;border:none;border-radius:12px;padding:0 1.25rem;height:48px;font-weight:700;cursor:pointer}
 button.send:disabled{opacity:.5}
 .tools-bar{display:flex;gap:.45rem;margin-bottom:.65rem;flex-wrap:wrap}
 .tools-bar select,.tools-bar button{background:#0f172a;border:1px solid var(--border);color:var(--text);padding:.35rem .7rem;border-radius:8px;font-size:.82rem}
@@ -1819,8 +3466,15 @@ footer.brand-footer strong{color:var(--accent)}
   <div class="stats">
     <span id="name-display" style="cursor:pointer;color:var(--accent);position:relative;z-index:50;pointer-events:auto" onclick="openNameModal()" title="Change name">👤 Set name</span>
     <span id="xp-display">⭐ 0 XP</span>
+    <span id="coins-display" style="cursor:pointer" onclick="openSpinModal()" title="Daily Spin">🪙 0</span>
+    <span id="streak-display" title="Streak">🔥 0</span>
     <span id="level-display">Level 1</span>
     <span id="quota-display">Free</span>
+    <select id="langSelect" onchange="changeLanguage(this.value)" title="Language" style="background:#0f172a;color:#f1f5f9;border:1px solid rgba(255,255,255,.12);border-radius:6px;padding:.2rem .4rem;font-size:.75rem">
+      <option value="hinglish">🔤 Hinglish</option>
+      <option value="hindi">🇮🇳 Hindi</option>
+      <option value="english">🇬🇧 English</option>
+    </select>
     <button class="pro-btn-top" onclick="openProModal()">💎 Pro</button>
   </div>
 </header>
@@ -1856,8 +3510,29 @@ footer.brand-footer strong{color:var(--accent)}
     <button class="tool-btn" data-tool="diagram">🧬 Diagram Explain <span class="pro-badge">PRO</span></button>
     <button class="tool-btn" data-tool="youtube">📺 YouTube Notes <span class="pro-badge">PRO</span></button>
     <button class="pay-side" onclick="openProModal()">❌ Limit over? Doubt yahin rukega — Pro ₹{{ price }}/30d</button>
+    <h3>🎮 Practice</h3>
+    <button class="tool-btn" onclick="openQuizModal()">❓ Quiz Me</button>
+    <button class="tool-btn" onclick="openGaltiModal()">📖 Galti Diary</button>
     <h3>🏆 Live Leaderboard</h3>
     <div id="lb-list">Loading...</div>
+    <h3>🎁 Refer & Earn</h3>
+    <div style="background:#0f172a;border:1px solid var(--border);border-radius:10px;padding:.7rem;margin-bottom:.5rem">
+      <p style="font-size:.78rem;color:var(--muted);margin-bottom:.5rem">
+        Har referral pe <strong style="color:var(--accent)">{{ referral_coins }} coins</strong> dono ko milte hain.
+        Har 5 referral pe <strong style="color:var(--accent)">3 din free Pro</strong>!
+      </p>
+      <div style="display:flex;gap:.35rem">
+        <input id="referralLinkBox" readonly style="flex:1;background:#0b1220;border:1px solid var(--border);border-radius:6px;color:var(--text);padding:.4rem .5rem;font-size:.78rem" />
+        <button class="tool-btn" style="width:auto;padding:.4rem .6rem;font-size:.78rem" onclick="copyReferralLink()">Copy</button>
+      </div>
+      <a id="referralWhatsappShare" href="#" target="_blank" rel="noopener"
+         style="display:block;margin-top:.5rem;text-align:center;background:#25D366;color:#0b1220;border-radius:6px;padding:.4rem;font-size:.78rem;font-weight:700;text-decoration:none">
+        📤 Share on WhatsApp
+      </a>
+      <p id="referralCountText" style="font-size:.75rem;color:var(--muted);margin-top:.4rem"></p>
+    </div>
+    <h3>🎁 Referral Raja</h3>
+    <div id="ref-lb-list">Loading...</div>
   </aside>
   <section class="chat-area">
     <div class="messages" id="messages">
@@ -1911,7 +3586,81 @@ footer.brand-footer strong{color:var(--accent)}
     </div>
   </section>
 </main>
-<footer class="brand-footer">🎓 SaarthiBhai — built with ❤️ by <strong>Sparsh Singhal</strong></footer>
+<footer class="brand-footer">🎓 SaarthiBhai — built with ❤️ by <strong>Sparsh Singhal</strong> · <a href="/legal" style="color:var(--accent)">Legal</a></footer>
+
+<div class="modal-bg" id="quizModal">
+  <div class="modal" style="max-width:480px">
+    <h2>❓ Quiz Me</h2>
+    <div id="quizSetup">
+      <input id="quizTopic" class="name-input" type="text" placeholder="Topic — e.g. Thermodynamics" />
+      <label style="display:flex;align-items:center;gap:.4rem;font-size:.85rem;color:var(--muted);margin:.4rem 0">
+        <input type="checkbox" id="quizFromGalti"> Build from my Galti Diary instead
+      </label>
+      <div style="display:flex;gap:.4rem;margin:.5rem 0" id="quizModeRow">
+        <button type="button" class="tool-btn quiz-mode-btn active" data-mode="practice" onclick="selectQuizMode('practice')" style="flex:1;text-align:center">Practice</button>
+        <button type="button" class="tool-btn quiz-mode-btn" data-mode="exam" onclick="selectQuizMode('exam')" style="flex:1;text-align:center">Exam ⏱️<span class="pro-badge">PRO</span></button>
+        <button type="button" class="tool-btn quiz-mode-btn" data-mode="1v1" onclick="selectQuizMode('1v1')" style="flex:1;text-align:center">1v1 🤝<span class="pro-badge">PRO</span></button>
+      </div>
+      <div class="actions">
+        <button class="btn-pro" onclick="startQuiz()">Start Quiz</button>
+        <button class="btn-close" onclick="closeQuizModal()">Cancel</button>
+      </div>
+      <p id="quizSetupMsg" style="margin-top:.5rem;font-size:.8rem;color:var(--muted)"></p>
+    </div>
+    <div id="quizPlay" style="display:none">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <p id="quizProgress" style="color:var(--muted);font-size:.85rem"></p>
+        <p id="quizTimer" style="color:#f87171;font-weight:700;font-size:.9rem;display:none"></p>
+      </div>
+      <p id="quizQuestion" style="font-weight:700;margin:.5rem 0 .8rem"></p>
+      <div id="quizOptions"></div>
+      <div id="quizLifelines" style="display:flex;gap:.4rem;margin-top:.6rem"></div>
+      <p id="quizHintText" style="margin-top:.5rem;font-size:.82rem;color:#fbbf24;display:none"></p>
+      <p id="quizFeedback" style="margin-top:.6rem;font-size:.88rem"></p>
+      <button class="btn-pro" id="quizNextBtn" style="display:none;width:100%;margin-top:.7rem" onclick="quizNext()">Next →</button>
+    </div>
+    <div id="quizResult" style="display:none;text-align:center">
+      <h3 id="quizScoreText" style="margin:.5rem 0"></h3>
+      <p id="quizVerdictText" style="color:var(--muted);font-size:.9rem"></p>
+      <div id="quizChallengeShare" style="display:none;margin-top:.8rem">
+        <p style="font-size:.82rem;color:var(--muted);margin-bottom:.4rem">Dost ko bhejo, wahi quiz khelega:</p>
+        <div class="copy-row" style="display:flex;gap:.5rem">
+          <input id="quizChallengeLink" class="name-input" readonly style="margin:0;flex:1" />
+          <button class="secondary" onclick="copyQuizChallengeLink()">Copy</button>
+        </div>
+        <div id="quizChallengeResults" style="margin-top:.6rem;font-size:.85rem;color:var(--muted)"></div>
+      </div>
+      <button class="btn-pro" style="width:100%;margin-top:.8rem" onclick="closeQuizModal()">Done</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-bg" id="galtiModal">
+  <div class="modal" style="max-width:480px;max-height:80vh">
+    <h2>📖 Galti Diary</h2>
+    <div id="galtiList" style="margin-top:.8rem;text-align:left;font-size:.85rem;color:var(--muted)">Loading...</div>
+    <div class="actions"><button class="btn-close" style="width:100%" onclick="closeGaltiModal()">Close</button></div>
+  </div>
+</div>
+
+<div class="modal-bg" id="spinModal">
+  <div class="modal" style="max-width:340px;text-align:center">
+    <h2>🎡 Daily Spin</h2>
+    <p style="color:var(--muted);font-size:.9rem;margin:.5rem 0">Roz ek spin free — {{ spin_min }} se {{ spin_max }} coins tak!</p>
+    <div style="position:relative;width:220px;height:220px;margin:1rem auto">
+      <div style="position:absolute;top:-6px;left:50%;transform:translateX(-50%);font-size:1.4rem;z-index:2;filter:drop-shadow(0 2px 2px rgba(0,0,0,.4))">🔻</div>
+      <div id="spinWheel" style="width:220px;height:220px;border-radius:50%;border:4px solid #0f172a;box-shadow:0 0 0 3px var(--accent);
+           background:conic-gradient(#22d3ee 0deg 45deg,#a78bfa 45deg 90deg,#ec4899 90deg 135deg,#22d3ee 135deg 180deg,
+           #a78bfa 180deg 225deg,#ec4899 225deg 270deg,#22d3ee 270deg 315deg,#a78bfa 315deg 360deg);
+           transition:transform 2.2s cubic-bezier(0.17,0.67,0.32,1.02);display:flex;align-items:center;justify-content:center">
+        <div style="width:70px;height:70px;border-radius:50%;background:#0b1220;display:flex;align-items:center;justify-content:center;font-size:1.8rem">🪙</div>
+      </div>
+    </div>
+    <div id="spinResult" style="font-size:1.4rem;margin:.5rem 0;min-height:1.8rem;font-weight:700"></div>
+    <button class="btn-pro" id="spinBtn" style="width:100%" onclick="doSpin()">Spin Now</button>
+    <button class="btn-close" style="width:100%;margin-top:.5rem" onclick="closeSpinModal()">Close</button>
+  </div>
+</div>
 
 
 <div class="modal-bg" id="proOnlyModal" onclick="if(event.target===this)closeProOnlyModal()">
@@ -1961,6 +3710,7 @@ footer.brand-footer strong{color:var(--accent)}
     <h2>👤 Apna naam likho</h2>
     <p style="color:var(--muted);font-size:.9rem;margin-top:.4rem">Yeh naam leaderboard pe dikhega</p>
     <input id="nameInput" class="name-input" type="text" maxlength="40" placeholder="e.g. Rahul Sharma" />
+    <input id="phoneInput" class="name-input" type="tel" maxlength="16" placeholder="Mobile number (Supabase ID)" style="margin-top:.55rem" />
     <div class="actions">
       <button class="btn-pro" onclick="saveName()">Save</button>
       <button class="btn-close" onclick="closeNameModal()">Skip</button>
@@ -2169,7 +3919,7 @@ function pickMedia(kind){
       ta.placeholder = "YouTube video link + kya notes chahiye? paste URL...";
       ta.focus();
     }
-    addMessage("bot", "▶️ **YouTube Notes (Pro)**\\nVideo ka link yahan paste karo aur Fire dabao. Example: `https://youtube.com/watch?v=...` + topic");
+    addMessage("bot", "▶️ **YouTube Notes (Pro)**\\nVideo ka link yahan paste karo aur Fire dabao. Example: `{{ youtube_example_url }}` + topic");
   }
 }
 function handleMediaFile(input, kind){
@@ -2304,6 +4054,7 @@ function openNameModal(){
   if(input && cur && !cur.includes("Set name")){
     input.value = cur.replace(/^👤\s*/, "").trim();
   }
+  try{ const ph = localStorage.getItem("sg_phone") || ""; const pi = document.getElementById("phoneInput"); if(pi && ph) pi.value = ph; }catch(e){}
   setTimeout(() => { try{ input && input.focus(); }catch(e){} }, 50);
   try{ soundClick(); }catch(e){}
 }
@@ -2316,6 +4067,8 @@ async function saveName(){
   const input = document.getElementById("nameInput");
   const msg = document.getElementById("nameMsg");
   const name = (input && input.value || "").trim();
+  const phoneInput = document.getElementById("phoneInput");
+  const phone = (phoneInput && phoneInput.value || "").trim();
   if(!name || name.length < 2){
     if(msg){ msg.style.color = "#f87171"; msg.textContent = "Naam kam se kam 2 letters ka ho"; }
     try{ soundError(); }catch(e){}
@@ -2325,13 +4078,13 @@ async function saveName(){
     const res = await fetch("/api/set-name", {
       method: "POST",
       headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({ client_id: clientId, name })
+      body: JSON.stringify({ client_id: clientId, name, phone_number: phone })
     });
     const data = await res.json();
     if(data.ok){
       const el = document.getElementById("name-display");
       if(el) el.textContent = "👤 " + data.name;
-      try{ localStorage.setItem("sg_name", data.name); }catch(e){}
+      try{ localStorage.setItem("sg_name", data.name); if(data.phone_number) localStorage.setItem("sg_phone", data.phone_number); }catch(e){}
       if(msg){ msg.style.color = "#22d3ee"; msg.textContent = "Saved!"; }
       try{ soundRecv(); }catch(e){}
       setTimeout(closeNameModal, 400);
@@ -2360,10 +4113,12 @@ async function syncProfile(){
   try{
     const params = new URLSearchParams(window.location.search);
     const refFromUrl = params.get("ref") || "";
-    const url = "/api/me?client_id=" + encodeURIComponent(clientId) + (refFromUrl ? "&ref=" + encodeURIComponent(refFromUrl) : "");
+    const savedPhone = (()=>{ try{return localStorage.getItem("sg_phone")||"";}catch(e){return "";} })();
+    const url = "/api/me?client_id=" + encodeURIComponent(clientId) + (savedPhone ? "&phone_number=" + encodeURIComponent(savedPhone) : "") + (refFromUrl ? "&ref=" + encodeURIComponent(refFromUrl) : "");
     const res = await fetch(url);
     const data = await res.json();
     if(!data.ok) return;
+    if(data.phone_number){ try{ localStorage.setItem("sg_phone", data.phone_number); }catch(e){} }
     if(data.name && data.name !== "Web Student" && data.name !== "Student"){
       const el = document.getElementById("name-display");
       if(el) el.textContent = "👤 " + data.name;
@@ -2375,6 +4130,32 @@ async function syncProfile(){
     if(data.level !== undefined){
       const l = document.getElementById("level-display");
       if(l) l.textContent = `Level ${data.level}`;
+    }
+    if(data.coins !== undefined){
+      const c = document.getElementById("coins-display");
+      if(c) c.textContent = `🪙 ${data.coins}` + (data.spin_available ? " (Spin!)" : "");
+    }
+    if(data.streak !== undefined){
+      const s = document.getElementById("streak-display");
+      if(s){
+        s.textContent = `🔥 ${data.streak}` + (data.shields ? ` 🛡️${data.shields}` : "");
+        s.title = `Best streak: ${data.best_streak || 0} days`;
+      }
+    }
+    if(data.language){
+      const sel = document.getElementById("langSelect");
+      if(sel) sel.value = data.language;
+    }
+    if(data.referral_code){
+      const link = window.location.origin + "/?ref=" + encodeURIComponent(data.referral_code);
+      const box = document.getElementById("referralLinkBox");
+      if(box) box.value = link;
+      const wa = document.getElementById("referralWhatsappShare");
+      if(wa) wa.href = "{{ whatsapp_share_url }}" + encodeURIComponent(
+        `Padhai ke liye SaarthiBhai try kar — AI tutor, unlimited doubts. Mera link se join karo, dono ko coins milenge: ${link}`
+      );
+      const countEl = document.getElementById("referralCountText");
+      if(countEl) countEl.textContent = `👥 ${data.referral_count || 0} dost refer kiye`;
     }
     if(data.plan === "pro" || (data.quota && data.quota.daily_left === -1) || data.plan_raw === "pro"){
       isProUser = true;
@@ -2393,7 +4174,40 @@ async function syncProfile(){
     }
   }catch(e){}
 }
+
+// Auto-join a teacher's class if the page was opened via a /?join_class=CODE
+// link (from the Teacher Dashboard's "Copy Link" button).
+async function autoJoinClassFromUrl(){
+  try{
+    const params = new URLSearchParams(window.location.search);
+    const code = (params.get("join_class") || "").trim();
+    if(!code) return;
+    const res = await fetch("/api/join-class", {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ client_id: clientId, code })
+    });
+    const data = await res.json();
+    if(typeof addMessage === "function"){
+      addMessage("bot", data.ok
+        ? `🏫 Class **${data.class_code}** join ho gaya! Teacher ab tumhara progress dekh payega.`
+        : `❌ Class join nahi hua: ${data.error || "invalid code"}`);
+    }
+    history.replaceState({}, "", "/");
+  }catch(e){}
+}
+
 syncProfile();
+autoJoinClassFromUrl();
+(function(){
+  try{
+    const params = new URLSearchParams(window.location.search);
+    const challengeId = (params.get("challenge") || "").trim();
+    if(challengeId && typeof joinQuizChallenge === "function"){
+      joinQuizChallenge(challengeId);
+      history.replaceState({}, "", "/");
+    }
+  }catch(e){}
+})();
 
 const TOOL_PLACEHOLDERS = {
   general: "Dimaag mein kya ghoom raha hai? Poocho... 🔥",
@@ -2615,7 +4429,7 @@ async function ask(){
     const res = await fetch("/api/webask", {
       method: "POST",
       headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({ question: q, tool: currentTool, client_id: clientId, image_base64: imageBase64 || undefined, image_mime: window._imageMime || "image/jpeg", media_kind: window._mediaKind || mediaKind || undefined })
+      body: JSON.stringify({ question: q, tool: currentTool, client_id: clientId, phone_number: (localStorage.getItem("sg_phone") || ""), image_base64: imageBase64 || undefined, image_mime: window._imageMime || "image/jpeg", media_kind: window._mediaKind || mediaKind || undefined })
     });
     const data = await res.json();
     loading.remove();
@@ -2631,6 +4445,18 @@ async function ask(){
       const qq = data.quota;
       isProUser = (qq.daily_left === -1);
       document.getElementById("quota-display").textContent = qq.daily_left === -1 ? "PRO ∞" : `Free: ${qq.daily_left} left`;
+    }
+    if(data.coins !== undefined){
+      const c = document.getElementById("coins-display");
+      if(c) c.textContent = `🪙 ${data.coins}`;
+    }
+    if(data.streak && data.streak.current !== undefined){
+      const s = document.getElementById("streak-display");
+      if(s) s.textContent = `🔥 ${data.streak.current}` + (data.streak.shields ? ` 🛡️${data.streak.shields}` : "");
+    }
+    if(data.language){
+      const sel = document.getElementById("langSelect");
+      if(sel) sel.value = data.language;
     }
   }catch(err){
     loading.remove();
@@ -2684,6 +4510,375 @@ async function loadLB(){
   }catch(e){}
 })();
 
+async function loadRefLB(){
+  try{
+    const res = await fetch("/api/leaderboard/referrals");
+    const data = await res.json();
+    const list = document.getElementById("ref-lb-list");
+    if(!list) return;
+    if(!data.board || !data.board.length){
+      list.innerHTML = "<div style='color:#64748b;font-size:.85rem'>No referrals yet</div>";
+      return;
+    }
+    list.innerHTML = data.board.map(e=>
+      `<div class="lb-item"><span>${e.rank}. ${e.name}</span><span>${e.referrals} 👥</span></div>`
+    ).join("");
+  }catch{}
+}
+loadRefLB();
+setInterval(loadRefLB, 60000);
+
+async function changeLanguage(lang){
+  try{
+    await fetch("/api/set-language", {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ client_id: clientId, language: lang })
+    });
+    try{ localStorage.setItem("sg_lang", lang); }catch(e){}
+  }catch(e){}
+}
+(function(){
+  try{
+    const saved = localStorage.getItem("sg_lang");
+    if(saved){ const sel = document.getElementById("langSelect"); if(sel) sel.value = saved; }
+  }catch(e){}
+})();
+
+// ---------------- QUIZ ----------------
+let quizState = { quizId: null, questions: [], idx: 0, answers: [], picked: null,
+                   mode: "practice", lifelines: {}, hiddenOptions: [], timer: null, timeLeft: 0 };
+let selectedQuizMode = "practice";
+
+function selectQuizMode(mode){
+  selectedQuizMode = mode;
+  document.querySelectorAll(".quiz-mode-btn").forEach(b => {
+    b.classList.toggle("active", b.getAttribute("data-mode") === mode);
+  });
+  try{ soundClick(); }catch(e){}
+}
+
+function openQuizModal(){
+  document.getElementById("quizModal").classList.add("show");
+  document.getElementById("quizSetup").style.display = "block";
+  document.getElementById("quizPlay").style.display = "none";
+  document.getElementById("quizResult").style.display = "none";
+  document.getElementById("quizChallengeShare").style.display = "none";
+  selectQuizMode("practice");
+  const msg = document.getElementById("quizSetupMsg");
+  if(msg) msg.textContent = "";
+}
+function closeQuizModal(){
+  document.getElementById("quizModal").classList.remove("show");
+  stopQuizTimer();
+}
+async function startQuiz(){
+  const topic = document.getElementById("quizTopic").value.trim();
+  const fromGalti = document.getElementById("quizFromGalti").checked;
+  const msg = document.getElementById("quizSetupMsg");
+  if(!topic && !fromGalti){
+    if(msg){ msg.style.color="#f87171"; msg.textContent = "Topic likho ya Galti Diary select karo."; }
+    return;
+  }
+  if(msg){ msg.style.color="#94a3b8"; msg.textContent = "Generating quiz..."; }
+  try{
+    const res = await fetch("/api/quiz/generate", {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ client_id: clientId, topic, use_galti_diary: fromGalti, mode: selectedQuizMode })
+    });
+    const data = await res.json();
+    if(!data.ok){
+      if(msg){ msg.style.color="#f87171"; msg.textContent = data.error || "Failed"; }
+      return;
+    }
+    quizState = { quizId: data.quiz_id, questions: data.questions, idx: 0, answers: [], picked: null,
+                  mode: data.mode || selectedQuizMode, lifelines: data.lifelines || {}, hiddenOptions: [],
+                  timerSec: data.timer_per_question_sec, timeLeft: data.timer_per_question_sec || 0 };
+    document.getElementById("quizSetup").style.display = "none";
+    document.getElementById("quizPlay").style.display = "block";
+    renderQuizQuestion();
+  }catch(e){
+    if(msg){ msg.style.color="#f87171"; msg.textContent = "Network error"; }
+  }
+}
+
+// Join an existing 1v1 challenge quiz (via /?challenge=quiz_id link)
+async function joinQuizChallenge(quizId){
+  try{
+    const res = await fetch("/api/quiz/join/" + encodeURIComponent(quizId));
+    const data = await res.json();
+    if(!data.ok){
+      if(typeof addMessage === "function") addMessage("bot", `❌ Challenge link expired ya invalid: ${data.error||""}`);
+      return;
+    }
+    quizState = { quizId, questions: data.questions, idx: 0, answers: [], picked: null,
+                  mode: "1v1", lifelines: data.lifelines || {}, hiddenOptions: [],
+                  timerSec: data.timer_per_question_sec, timeLeft: data.timer_per_question_sec || 0 };
+    openQuizModal();
+    document.getElementById("quizSetup").style.display = "none";
+    document.getElementById("quizPlay").style.display = "block";
+    renderQuizQuestion();
+  }catch(e){}
+}
+
+function stopQuizTimer(){
+  if(quizState.timer){ clearInterval(quizState.timer); quizState.timer = null; }
+  const t = document.getElementById("quizTimer");
+  if(t) t.style.display = "none";
+}
+function startQuizTimer(){
+  const t = document.getElementById("quizTimer");
+  if(!quizState.timerSec){ if(t) t.style.display = "none"; return; }
+  quizState.timeLeft = quizState.timerSec;
+  t.style.display = "block";
+  t.textContent = `⏱️ ${quizState.timeLeft}s`;
+  if(quizState.timer) clearInterval(quizState.timer);
+  quizState.timer = setInterval(() => {
+    quizState.timeLeft -= 1;
+    t.textContent = `⏱️ ${quizState.timeLeft}s`;
+    if(quizState.timeLeft <= 0){
+      clearInterval(quizState.timer);
+      quizState.timer = null;
+      if(quizState.picked === null){
+        quizState.picked = -1;
+        quizState.answers[quizState.idx] = -1;
+        document.getElementById("quizFeedback").textContent = "⏱️ Time up! Auto-moving to next question.";
+        document.getElementById("quizNextBtn").style.display = "block";
+      }
+    }
+  }, 1000);
+}
+
+function renderQuizQuestion(){
+  const q = quizState.questions[quizState.idx];
+  quizState.picked = null;
+  quizState.hiddenOptions = [];
+  document.getElementById("quizProgress").textContent = `Q${quizState.idx+1}/${quizState.questions.length}` +
+    (quizState.mode === "1v1" ? " · 1v1" : "");
+  document.getElementById("quizQuestion").textContent = q.q;
+  document.getElementById("quizFeedback").textContent = "";
+  document.getElementById("quizHintText").style.display = "none";
+  document.getElementById("quizNextBtn").style.display = "none";
+  renderQuizOptions();
+  renderQuizLifelines();
+  if(quizState.mode === "exam") startQuizTimer(); else stopQuizTimer();
+}
+function renderQuizOptions(){
+  const q = quizState.questions[quizState.idx];
+  const opts = document.getElementById("quizOptions");
+  opts.innerHTML = "";
+  q.options.forEach((opt, i) => {
+    if(quizState.hiddenOptions.includes(i)) return;
+    const btn = document.createElement("button");
+    btn.className = "tool-btn";
+    btn.style.marginBottom = ".35rem";
+    btn.textContent = String.fromCharCode(65+i) + ". " + opt;
+    btn.onclick = () => pickQuizOption(i);
+    opts.appendChild(btn);
+  });
+}
+function renderQuizLifelines(){
+  const box = document.getElementById("quizLifelines");
+  box.innerHTML = "";
+  if(!quizState.lifelines || (!quizState.lifelines.fifty_fifty && !quizState.lifelines.hint && !quizState.lifelines.skip)) return;
+  const mk = (label, fn) => {
+    const b = document.createElement("button");
+    b.className = "tool-btn"; b.style.flex = "1"; b.style.fontSize = ".8rem";
+    b.textContent = label; b.onclick = fn;
+    return b;
+  };
+  if(quizState.lifelines.fifty_fifty) box.appendChild(mk("50:50", () => useLifeline("fifty_fifty")));
+  if(quizState.lifelines.hint) box.appendChild(mk("💡 Hint", () => useLifeline("hint")));
+  if(quizState.lifelines.skip) box.appendChild(mk("⏭️ Skip", () => useLifeline("skip")));
+}
+async function useLifeline(type){
+  try{
+    const res = await fetch("/api/quiz/lifeline", {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ client_id: clientId, quiz_id: quizState.quizId, q_index: quizState.idx, type })
+    });
+    const data = await res.json();
+    if(!data.ok){
+      document.getElementById("quizFeedback").textContent = data.error || "Lifeline use nahi hui";
+      return;
+    }
+    if(type === "fifty_fifty"){
+      quizState.hiddenOptions = data.eliminate_indices || [];
+      renderQuizOptions();
+    } else if(type === "hint"){
+      const h = document.getElementById("quizHintText");
+      h.style.display = "block";
+      h.textContent = "💡 " + (data.hint || "");
+    } else if(type === "skip"){
+      quizState.answers[quizState.idx] = -1;
+      quizNext();
+      return;
+    }
+    try{ soundClick(); }catch(e){}
+  }catch(e){
+    document.getElementById("quizFeedback").textContent = "Network error";
+  }
+}
+function pickQuizOption(i){
+  if(quizState.picked !== null) return;
+  quizState.picked = i;
+  quizState.answers[quizState.idx] = i;
+  document.getElementById("quizNextBtn").style.display = "block";
+  document.getElementById("quizFeedback").textContent = "Selected. Tap Next to continue →";
+  stopQuizTimer();
+  try{ soundClick(); }catch(e){}
+}
+function quizNext(){
+  stopQuizTimer();
+  quizState.idx += 1;
+  quizState.picked = null;
+  if(quizState.idx >= quizState.questions.length){
+    submitQuiz();
+  } else {
+    renderQuizQuestion();
+  }
+}
+async function submitQuiz(){
+  try{
+    const res = await fetch("/api/quiz/submit", {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ client_id: clientId, quiz_id: quizState.quizId, answers: quizState.answers })
+    });
+    const data = await res.json();
+    document.getElementById("quizPlay").style.display = "none";
+    document.getElementById("quizResult").style.display = "block";
+    if(data.ok){
+      document.getElementById("quizScoreText").textContent = `Score: ${data.score}/${data.total}`;
+      const bonus = [];
+      if(data.xp_gain) bonus.push(`+${data.xp_gain} XP`);
+      if(data.coins_gain) bonus.push(`+${data.coins_gain} 🪙`);
+      document.getElementById("quizVerdictText").textContent = data.verdict + (bonus.length ? ` (${bonus.join(", ")})` : "");
+      if(data.coins_total !== undefined){
+        const c = document.getElementById("coins-display");
+        if(c) c.textContent = `🪙 ${data.coins_total}`;
+      }
+      if(quizState.mode === "1v1"){
+        const share = document.getElementById("quizChallengeShare");
+        share.style.display = "block";
+        document.getElementById("quizChallengeLink").value = window.location.origin + "/?challenge=" + quizState.quizId;
+        loadQuizChallengeResults(quizState.quizId);
+      }
+      try{ soundRecv(); }catch(e){}
+      syncProfile();
+    } else {
+      document.getElementById("quizScoreText").textContent = "Error";
+      document.getElementById("quizVerdictText").textContent = data.error || "Could not submit";
+    }
+  }catch(e){
+    document.getElementById("quizPlay").style.display = "none";
+    document.getElementById("quizResult").style.display = "block";
+    document.getElementById("quizScoreText").textContent = "Network error";
+  }
+}
+function copyQuizChallengeLink(){
+  const box = document.getElementById("quizChallengeLink");
+  box.select();
+  try{ navigator.clipboard.writeText(box.value); }catch(e){ document.execCommand("copy"); }
+}
+function copyReferralLink(){
+  const box = document.getElementById("referralLinkBox");
+  if(!box || !box.value) return;
+  box.select();
+  try{ navigator.clipboard.writeText(box.value); }catch(e){ document.execCommand("copy"); }
+  try{ soundClick(); }catch(e){}
+}
+async function loadQuizChallengeResults(quizId){
+  const box = document.getElementById("quizChallengeResults");
+  try{
+    const res = await fetch("/api/quiz/challenge/" + encodeURIComponent(quizId));
+    const data = await res.json();
+    if(!data.ok || !data.results || !data.results.length){
+      box.textContent = "Abhi tak koi result nahi — link share karo!";
+      return;
+    }
+    box.innerHTML = data.results
+      .sort((a,b) => b.score - a.score)
+      .map((r,i) => `${i===0 ? "🏆" : "  "} ${(r.name||"Player").replace(/</g,"&lt;")}: ${r.score}/${r.total}`)
+      .join("<br>");
+  }catch(e){
+    box.textContent = "";
+  }
+}
+
+// ---------------- GALTI DIARY ----------------
+function openGaltiModal(){
+  document.getElementById("galtiModal").classList.add("show");
+  loadGaltiDiary();
+}
+function closeGaltiModal(){
+  document.getElementById("galtiModal").classList.remove("show");
+}
+async function loadGaltiDiary(){
+  const list = document.getElementById("galtiList");
+  list.innerHTML = "Loading...";
+  try{
+    const res = await fetch("/api/galti-diary?client_id=" + encodeURIComponent(clientId));
+    const data = await res.json();
+    if(!data.mistakes || !data.mistakes.length){
+      list.innerHTML = "<div>Khaali hai! Koi mistake save nahi hui abhi tak 🔥</div>";
+      return;
+    }
+    list.innerHTML = data.mistakes.map(m =>
+      `<div style="padding:.5rem 0;border-bottom:1px solid var(--border)">
+         <div style="color:var(--text)">${(m.question||"").replace(/</g,"&lt;")}</div>
+         <div style="font-size:.78rem;color:#22d3ee;margin-top:.2rem">✅ ${(m.correct_answer||"").replace(/</g,"&lt;")}</div>
+       </div>`
+    ).join("");
+  }catch(e){
+    list.innerHTML = "Network error";
+  }
+}
+
+// ---------------- SPIN WHEEL ----------------
+let spinWheelRotation = 0;
+function openSpinModal(){
+  document.getElementById("spinModal").classList.add("show");
+  document.getElementById("spinResult").textContent = "";
+}
+function closeSpinModal(){
+  document.getElementById("spinModal").classList.remove("show");
+}
+async function doSpin(){
+  const btn = document.getElementById("spinBtn");
+  const res_el = document.getElementById("spinResult");
+  const wheel = document.getElementById("spinWheel");
+  btn.disabled = true;
+  res_el.textContent = "🎡 Spinning...";
+  // Spin visually right away (4-6 extra full turns) while the request is
+  // in flight, so the wheel is always mid-spin when the result arrives —
+  // the exact stop angle doesn't need to match a segment since the coin
+  // amount is announced as text once it lands.
+  spinWheelRotation += 1440 + Math.floor(Math.random() * 360);
+  wheel.style.transform = `rotate(${spinWheelRotation}deg)`;
+  try{ soundClick(); }catch(e){}
+  try{
+    const res = await fetch("/api/spin", {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ client_id: clientId })
+    });
+    const data = await res.json();
+    setTimeout(() => {
+      if(data.ok){
+        res_el.textContent = `🎉 +${data.coins_won} Coins!`;
+        try{ soundRecv(); }catch(e){}
+        syncProfile();
+      } else {
+        res_el.textContent = data.error || "Already spun today";
+        try{ soundError(); }catch(e){}
+      }
+      btn.disabled = false;
+    }, 2200); // matches the wheel's CSS transition duration
+    return;
+  }catch(e){
+    res_el.textContent = "Network error";
+  }
+  btn.disabled = false;
+}
+
 loadLB();
 setInterval(loadLB, 30000);
 </script>
@@ -2697,7 +4892,7 @@ PAY_HTML = r"""
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Upgrade Pro – SaarthiBhai by Sparsh Singhal</title>
-<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+<script src="{{ razorpay_checkout_js }}"></script>
 <style>
 body{font-family:system-ui,sans-serif;background:#0b1220;color:#f1f5f9;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}
 .card{background:#111827;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:2rem;max-width:420px;width:90%;text-align:center}
@@ -2781,11 +4976,200 @@ async function startPay(){
 </html>
 """
 
+TEACHER_HTML = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Teacher Dashboard — SaarthiBhai</title>
+<style>
+:root{--bg:#ffffff;--card:#ffffff;--accent:{{ theme_primary }};--text:#111111;--muted:#575757;--border:rgba(17,17,17,.12)}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+header{background:linear-gradient(90deg,#0f172a,#1e1b4b);padding:1rem 1.5rem;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.5rem}
+header h1{font-size:1.15rem}header h1 span{color:var(--accent)}
+main{max-width:960px;margin:0 auto;padding:1.5rem}
+.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:1.25rem;margin-bottom:1.25rem}
+.card h2{font-size:1rem;margin-bottom:.75rem;color:var(--accent)}
+input,button{font-family:inherit;font-size:.95rem}
+input[type=text]{width:100%;padding:.65rem .8rem;border-radius:8px;border:1px solid var(--border);background:#0f172a;color:var(--text);margin-bottom:.6rem}
+button{background:var(--accent);color:#0b1220;border:none;border-radius:8px;padding:.6rem 1.1rem;font-weight:700;cursor:pointer}
+button.secondary{background:#0f172a;color:var(--text);border:1px solid var(--border)}
+button:disabled{opacity:.5;cursor:not-allowed}
+.class-list{display:grid;gap:.75rem}
+.class-item{background:#0f172a;border:1px solid var(--border);border-radius:10px;padding:.9rem 1rem;display:flex;justify-content:space-between;align-items:center;cursor:pointer;flex-wrap:wrap;gap:.5rem}
+.class-item:hover{border-color:var(--accent)}
+.class-item .code{font-family:monospace;font-size:1.1rem;color:var(--accent);font-weight:700}
+.class-item .meta{color:var(--muted);font-size:.82rem}
+table{width:100%;border-collapse:collapse;font-size:.88rem}
+th,td{text-align:left;padding:.5rem .6rem;border-bottom:1px solid var(--border)}
+th{color:var(--muted);font-weight:600;font-size:.78rem;text-transform:uppercase}
+.badge{background:rgba(34,211,238,.15);color:var(--accent);padding:.15rem .5rem;border-radius:999px;font-size:.75rem}
+.empty{color:var(--muted);text-align:center;padding:1.5rem;font-size:.9rem}
+.copy-row{display:flex;gap:.5rem;align-items:center}
+.copy-row input{flex:1;margin:0}
+#msg{font-size:.85rem;color:var(--muted);margin-top:.5rem}
+a.back{color:var(--accent);text-decoration:none;font-size:.85rem}
+</style>
+</head>
+<body>
+<header>
+  <h1>🎓 Saarthi<span>Bhai</span> — Teacher Dashboard</h1>
+  <a class="back" href="/">← Back to chat</a>
+</header>
+<main>
+  <div class="card">
+    <h2>➕ Create a New Class</h2>
+    <input type="text" id="className" placeholder="Class name — e.g. DTU Sem1 Physics" />
+    <button onclick="createClass()">Create Class Code</button>
+    <p id="createMsg" style="margin-top:.5rem;font-size:.85rem;color:var(--muted)"></p>
+  </div>
+
+  <div class="card">
+    <h2>📚 Your Classes</h2>
+    <div id="classList" class="class-list"><p class="empty">Loading...</p></div>
+  </div>
+
+  <div class="card" id="detailCard" style="display:none">
+    <h2 id="detailTitle">Class</h2>
+    <div class="copy-row" style="margin-bottom:1rem">
+      <input type="text" id="joinLinkBox" readonly />
+      <button class="secondary" onclick="copyJoinLink()">Copy Link</button>
+    </div>
+    <table>
+      <thead><tr><th>#</th><th>Student</th><th>Level</th><th>XP</th><th>Streak</th><th>Questions</th></tr></thead>
+      <tbody id="studentRows"></tbody>
+    </table>
+    <div id="noStudents" class="empty" style="display:none">No students joined yet — share the class code above.</div>
+  </div>
+</main>
+<script>
+let teacherId = localStorage.getItem("sg_teacher_client") || ("teacher_" + Math.random().toString(36).slice(2));
+localStorage.setItem("sg_teacher_client", teacherId);
+
+async function createClass(){
+  const nameEl = document.getElementById("className");
+  const msg = document.getElementById("createMsg");
+  const name = nameEl.value.trim();
+  msg.style.color = "#94a3b8"; msg.textContent = "Creating...";
+  try{
+    const res = await fetch("/api/teacher/create-class", {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ client_id: teacherId, class_name: name })
+    });
+    const data = await res.json();
+    if(data.ok){
+      msg.style.color = "#22d3ee";
+      msg.textContent = `✅ Class code: ${data.class_code} — share this with students!`;
+      nameEl.value = "";
+      loadClasses();
+    } else {
+      msg.style.color = "#f87171";
+      msg.textContent = data.error || "Failed to create class";
+    }
+  }catch(e){
+    msg.style.color = "#f87171"; msg.textContent = "Network error";
+  }
+}
+
+async function loadClasses(){
+  const list = document.getElementById("classList");
+  try{
+    const res = await fetch("/api/teacher/classes?client_id=" + encodeURIComponent(teacherId));
+    const data = await res.json();
+    const classes = data.classes || [];
+    if(!classes.length){
+      list.innerHTML = "<p class='empty'>Koi class abhi tak nahi bani — upar se ek create karo.</p>";
+      return;
+    }
+    list.innerHTML = classes.map(c => `
+      <div class="class-item" onclick="openClass('${c.code}')">
+        <div>
+          <div>${(c.class_name||"Class").replace(/</g,"&lt;")}</div>
+          <div class="meta">Created ${c.created_at || ""}</div>
+        </div>
+        <div style="text-align:right">
+          <div class="code">${c.code}</div>
+          <div class="meta">${c.student_count || 0} students</div>
+        </div>
+      </div>
+    `).join("");
+  }catch(e){
+    list.innerHTML = "<p class='empty'>Network error loading classes.</p>";
+  }
+}
+
+async function openClass(code){
+  const card = document.getElementById("detailCard");
+  card.style.display = "block";
+  document.getElementById("detailTitle").textContent = "Class: " + code;
+  document.getElementById("joinLinkBox").value = window.location.origin + "/?join_class=" + code;
+  card.scrollIntoView({behavior:"smooth"});
+  try{
+    const res = await fetch("/api/teacher/class/" + encodeURIComponent(code));
+    const data = await res.json();
+    const rows = document.getElementById("studentRows");
+    const empty = document.getElementById("noStudents");
+    const students = data.students || [];
+    if(!students.length){
+      rows.innerHTML = "";
+      empty.style.display = "block";
+      return;
+    }
+    empty.style.display = "none";
+    rows.innerHTML = students.map((s,i) => `
+      <tr>
+        <td>${i+1}</td>
+        <td>${(s.name||"Student").replace(/</g,"&lt;")}</td>
+        <td><span class="badge">L${s.level}</span></td>
+        <td>${s.xp}</td>
+        <td>🔥 ${s.streak}</td>
+        <td>${s.questions_asked}</td>
+      </tr>
+    `).join("");
+  }catch(e){
+    document.getElementById("studentRows").innerHTML = "";
+    document.getElementById("noStudents").style.display = "block";
+    document.getElementById("noStudents").textContent = "Network error loading students.";
+  }
+}
+
+function copyJoinLink(){
+  const box = document.getElementById("joinLinkBox");
+  box.select();
+  try{
+    navigator.clipboard.writeText(box.value);
+  }catch(e){
+    document.execCommand("copy");
+  }
+}
+
+loadClasses();
+</script>
+</body>
+</html>
+"""
+
 # ============================================================================
 # FLASK
 # ============================================================================
 
 app = Flask(__name__)
+
+SAARTHIBHAI_CORS_ORIGIN = config.CORS_ORIGIN
+@app.after_request
+def _v7_cors(resp):
+    resp.headers["Access-Control-Allow-Origin"] = SAARTHIBHAI_CORS_ORIGIN
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Cron-Secret, X-Webhook-Secret"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, OPTIONS"
+    return resp
+
+
+
+@app.route("/teacher")
+def teacher_dashboard():
+    return render_template_string(TEACHER_HTML, theme_primary=config.THEME["primary"], brand_name=config.BRAND_NAME, creator_name=config.CREATOR_NAME)
 
 
 @app.route("/bot-icon.svg")
@@ -2869,7 +5253,11 @@ def serve_photo():
 
 @app.route("/")
 def home():
-    return render_template_string(FRONTEND_HTML, price=config.PRO_PRICE_INR)
+    return render_template_string(FRONTEND_HTML, price=config.PRO_PRICE_INR, referral_coins=config.REFERRAL_COINS,
+                                   spin_min=config.SPIN_MIN_COINS, spin_max=config.SPIN_MAX_COINS,
+                                   theme_primary=config.THEME["primary"], brand_name=config.BRAND_NAME, creator_name=config.CREATOR_NAME,
+                                   katex_css=config.URLS["katex_css"], katex_js=config.URLS["katex_js"], katex_auto_render_js=config.URLS["katex_auto_render_js"],
+                                   whatsapp_share_url=config.URLS["whatsapp_share_url"], youtube_example_url=config.CONTENT.get("youtube_example_url", ""))
 
 
 @app.route("/pay")
@@ -2880,7 +5268,9 @@ def pay_page():
     if not config.RAZORPAY_KEY_ID:
         return "Payment not configured.", 503
     return render_template_string(
-        PAY_HTML, uid=uid, price=config.PRO_PRICE_INR, key_id=config.RAZORPAY_KEY_ID
+        PAY_HTML, uid=uid, price=config.PRO_PRICE_INR, key_id=config.RAZORPAY_KEY_ID,
+        theme_primary=config.THEME["primary"], brand_name=config.BRAND_NAME, creator_name=config.CREATOR_NAME,
+        razorpay_checkout_js=config.URLS["razorpay_checkout_js"]
     )
 
 
@@ -2926,7 +5316,7 @@ def api_restore_pro():
             f"{config.RAZORPAY_KEY_ID}:{config.RAZORPAY_KEY_SECRET}".encode()
         ).decode()
         r = requests.get(
-            f"https://api.razorpay.com/v1/payments/{payment_id}",
+            f"{config.URLS["razorpay_payments"]}/{payment_id}",
             headers={"Authorization": f"Basic {auth}"},
             timeout=20,
         )
@@ -2934,15 +5324,22 @@ def api_restore_pro():
         if r.status_code >= 400:
             return jsonify({"ok": False, "error": pdata.get("error", {}).get("description", "Payment not found")}), 400
         status = (pdata.get("status") or "").lower()
-        if status not in ("captured", "authorized"):
-            return jsonify({"ok": False, "error": f"Payment not completed ({status})"}), 400
+        if status != "captured":
+            return jsonify({"ok": False, "error": f"Payment not captured ({status})"}), 400
         amount = int(pdata.get("amount") or 0)
         expected = int(config.PRO_PRICE_INR) * 100
         if amount < expected:
             return jsonify({"ok": False, "error": "Amount mismatch"}), 400
         # Bind this successful payment to current device uid
-        db.ensure_user(uid, full_name="Pro Student", platform="web")
+        db.ensure_user(uid, full_name=config.DEFAULT_STUDENT_NAMES["pro"], platform="web")
         db.activate_pro(uid, days=30)
+        try:
+            pu = db.get_user(uid) or {}
+            pu["last_payment_id"] = payment_id
+            db.save_user(uid, pu)
+            db.sync_user_to_supabase(uid, pu)
+        except Exception:
+            pass
         try:
             db.add_badge(uid, "Pro Warrior 👑")
         except Exception:
@@ -2980,8 +5377,9 @@ def api_me():
     if not client_id:
         return jsonify({"ok": False, "error": "client_id required"}), 400
     ref = (request.args.get("ref") or "").strip()
+    phone = normalize_phone(request.args.get("phone_number") or request.args.get("phone") or "")
     uid = f"web:{client_id}"
-    user = db.ensure_user(uid, full_name="Web Student", platform="web", referred_by=ref)
+    user = db.ensure_user(uid, full_name=config.DEFAULT_STUDENT_NAMES["web"], platform="web", referred_by=ref, phone_number=phone)
     db.register_referral_code(uid, user.get("referral_code", ""))
     xp = int(user.get("xp", 0) or 0)
     level = int(user.get("level", 1) or 1)
@@ -2989,31 +5387,70 @@ def api_me():
     return jsonify({
         "ok": True,
         "uid": uid,
-        "name": user.get("full_name") or "Student",
+        "name": user.get("full_name") or config.DEFAULT_STUDENT_NAMES["generic"],
         "xp": xp,
         "level": level,
+        "coins": db.get_coins(uid),
+        "spin_available": not db.spin_used_today(uid),
+        "language": db.get_language(uid),
+        "streak": int(user.get("streak", 0) or 0),
+        "best_streak": int(user.get("best_streak", 0) or 0),
+        "shields": int(user.get("shields", 0) or 0),
         "plan": "pro" if is_pro_now else "free",
         "plan_raw": user.get("plan", "free"),
         "pro_until": user.get("pro_until", ""),
         "quota": db.check_quota(uid)[1],
         "referral_code": user.get("referral_code", ""),
         "referral_count": user.get("referral_count", "0"),
+        "phone_number": user.get("phone_number", ""),
+        "exam_type": user.get("exam_type", "general"),
+        "subject": user.get("subject", "general"),
+        "welcome_just_claimed": _pop_welcome_flash(uid),
+        "welcome": {"coins": config.WELCOME_COINS, "spin_min": config.SPIN_MIN_COINS, "spin_max": config.SPIN_MAX_COINS, "spin_count": config.WELCOME_FREE_SPIN_COUNT, "freeze": config.WELCOME_FREEZE_COUNT},
     })
+
+
+def _pop_welcome_flash(uid: str | int) -> bool:
+    if not db.redis:
+        return False
+    try:
+        return bool(db.redis.delete(f"welcome_flash:{db._key(uid)}"))
+    except Exception:
+        return False
+
+
+@app.route("/api/spin", methods=["POST"])
+def api_spin():
+    """POINT 17/36 — daily spin wheel, one spin per account per day."""
+    data = request.get_json(silent=True) or {}
+    client_id = (data.get("client_id") or "").strip()
+    if not client_id:
+        return jsonify({"ok": False, "error": "client_id required"}), 400
+    uid = f"web:{client_id}"
+    db.ensure_user(uid, full_name=config.DEFAULT_STUDENT_NAMES["web"], platform="web")
+    won = db.do_spin(uid)
+    if won is None:
+        return jsonify({"ok": False, "error": "Aaj ka spin ho chuka hai. Kal wapas aana!"}), 429
+    return jsonify({"ok": True, "coins_won": won, "coins_total": db.get_coins(uid)})
 
 @app.route("/api/set-name", methods=["POST"])
 def api_set_name():
     data = request.get_json(silent=True) or {}
     client_id = (data.get("client_id") or "").strip()
     name = (data.get("name") or "").strip()[:40]
+    phone = normalize_phone(data.get("phone_number") or data.get("phone") or "")
     if not client_id:
         return jsonify({"ok": False, "error": "client_id required"}), 400
     if not name or len(name) < 2:
         return jsonify({"ok": False, "error": "Name too short"}), 400
     name = " ".join(name.split())
     uid = f"web:{client_id}"
-    udata = db.ensure_user(uid, full_name=name, platform="web")
+    udata = db.ensure_user(uid, full_name=name, platform="web", phone_number=phone)
     udata["full_name"] = name
+    if phone:
+        udata["phone_number"] = phone
     db.save_user(uid, udata)
+    db.sync_user_to_supabase(uid, udata)
     db.register_name_identity(uid, name)
     # soft signal: how many accounts share this name (multi-device)
     dup = 0
@@ -3022,7 +5459,7 @@ def api_set_name():
             dup = int(db.redis.scard(f"nameidx:{db.normalize_name(name)}") or 0)
     except Exception:
         pass
-    return jsonify({"ok": True, "name": name, "accounts_with_same_name": dup})
+    return jsonify({"ok": True, "name": name, "phone_number": udata.get("phone_number", ""), "accounts_with_same_name": dup})
 
 
 @app.route("/health")
@@ -3040,9 +5477,58 @@ def health():
             "gemini_flash_lite": ai.gemini_client is not None,
             "openrouter": ai.openrouter_ready,
         },
-        "version": "SaarthiBhai v6.12 (Rename to SaarthiBhai)",
-        "creator": "Sparsh Singhal",
+        "version": config.APP_VERSION,
+        "build_hash": BUILD_HASH,
+        "build_line_count": BUILD_LINE_COUNT,
+        "creator": config.CREATOR_NAME,
+        "features": _feature_status(),
     })
+
+
+def _feature_status() -> Dict[str, Any]:
+    """Ground-truth feature map read from the RUNNING deployment, not a
+    pasted file. Split into two kinds:
+      - "code": true means the capability is compiled into this build,
+        regardless of env config (these can never be a false positive —
+        the route/function either exists or this dict entry wouldn't
+        even be here).
+      - "ready": true means the code AND the external config it needs
+        (API keys, tokens, secrets) are both present, i.e. a real user
+        hitting that feature right now would get a working response.
+    """
+    return {
+        "code": {
+            "teacher_dashboard_ui": True,
+            "quiz_system": True,
+            "quiz_exam_mode_timer": True,
+            "quiz_lifelines": True,
+            "quiz_1v1_challenge": True,
+            "galti_diary": True,
+            "referral_share_ui": True,
+            "streak_shields_display": True,
+            "spin_wheel_ui": True,
+            "coins_economy": True,
+            "language_switcher": True,
+            "abuse_moderation": True,
+            "semantic_answer_cache": True,
+            "legal_page": True,
+            "parent_report_cron_route": True,
+            "exam_bomb_cron_route": True,
+        },
+        "ready": {
+            "razorpay_payments": bool(config.RAZORPAY_KEY_ID and config.RAZORPAY_KEY_SECRET),
+            "razorpay_webhook_verified": bool(config.RAZORPAY_WEBHOOK_SECRET),
+            "whatsapp_surface": bool(config.WHATSAPP_TOKEN and config.WHATSAPP_PHONE_NUMBER_ID),
+            "telegram_bot": bool(config.BOT_TOKEN),
+            "dev_admin_routes": bool(config.DEV_SECRET),
+            "cron_endpoints_callable": bool(config.DEV_SECRET),
+            "parent_report_can_actually_send": bool(config.WHATSAPP_TOKEN and config.WHATSAPP_PHONE_NUMBER_ID and config.DEV_SECRET),
+            "exam_bomb_can_actually_send": bool(config.WHATSAPP_TOKEN and config.WHATSAPP_PHONE_NUMBER_ID and config.DEV_SECRET),
+            "gemini_ai": ai.gemini_client is not None,
+            "groq_ai": ai.groq_client is not None,
+            "openrouter_ai": ai.openrouter_ready,
+        },
+    }
 
 
 @app.route("/api/debug/ai")
@@ -3098,19 +5584,25 @@ def web_ask():
     if is_rate_limited(f"web:{client_id}", max_calls=8, window_sec=60):
         return jsonify({"answer": "Too many requests. Wait a minute.\n\n- made with love by Sparsh Singhal"}), 429
     if len(image_b64) > 6_500_000:  # ~4.5MB binary -> base64 overhead cap
-        return jsonify({"answer": "Image too large. Please use under ~4MB.\n\n- made with love by Sparsh Singhal"}), 400
+        return jsonify({"answer": config.SYSTEM_PROTOCOL.get("image_too_large", "Image too large.")}), 400
     if not q and not image_b64:
         return jsonify({"answer": "Please type a question or upload an image"}), 400
     uid = f"web:{client_id}"
-    udata = db.ensure_user(uid, full_name="Web Student", platform="web")
+    if db.is_banned(uid):
+        return jsonify({"answer": format_ban_active_message(db.get_ban_remaining_seconds(uid)), "banned": True}), 403
+    if q and contains_abuse(q):
+        count, just_banned = db.record_abuse_warning(uid)
+        return jsonify({"answer": format_abuse_warning_message(count, just_banned), "abuse_warning": count, "banned": just_banned}), 403
+    supplied_phone = normalize_phone(data.get("phone_number") or data.get("phone") or "")
+    udata = db.ensure_user(uid, full_name=config.DEFAULT_STUDENT_NAMES["web"], platform="web", phone_number=supplied_phone, exam_type=data.get("exam_type") or "", subject=data.get("subject") or "")
     db.track_activity(uid)
     is_pro = db.is_pro(uid)
     media_kind = (data.get("media_kind") or ("image" if image_b64 else "")).strip().lower()
     # Images: allowed for free users. PDF / YouTube media: Pro-only.
     if tool in PRO_ONLY_TOOLS and not is_pro:
-        return jsonify({"answer": f"🔒 Pro-only.\n\nUpgrade ₹{config.PRO_PRICE_INR}/30 days.\n\n- made with love by Sparsh Singhal"})
+        return jsonify({"answer": f"{config.PRODUCT_TEXT["pro_tool"]}\n\n{config.PRODUCT_TEXT["pro_upgrade"].format(price=config.PRO_PRICE_INR)}"})
     if image_b64 and media_kind in ("pdf", "youtube") and not is_pro:
-        return jsonify({"answer": f"🔒 Pro-only.\n\nUpgrade ₹{config.PRO_PRICE_INR}/30 days.\n\n- made with love by Sparsh Singhal"})
+        return jsonify({"answer": f"{config.PRODUCT_TEXT["pro_tool"]}\n\n{config.PRODUCT_TEXT["pro_upgrade"].format(price=config.PRO_PRICE_INR)}"})
     if not is_pro:
         can, quota = db.try_consume_quota(uid)
         if not can:
@@ -3124,19 +5616,25 @@ def web_ask():
             mime = data.get("image_mime") or data.get("media_mime") or "image/jpeg"
             # Always honour the tool the user selected in the dropdown
             tool_for_media = tool or "general"
-            answer = run_ai(ai.answer_with_image, img_bytes, mime, q, tool_for_media, is_pro)
+            answer = run_ai(ai.answer_with_image, img_bytes, mime, q, tool_for_media, is_pro, language=db.get_language(uid))
         except Exception as e:
             logger.error("Media: %s", e)
             answer = "Could not read the file. Try a clearer image or smaller PDF."
     else:
-        ckey = make_cache_key(tool, q, is_pro)
-        answer = db.cache_get(ckey)
-        if answer:
-            cached = True
-        else:
-            answer = run_ai(ai.answer, q, tool, is_pro=is_pro)
-            if answer and not str(answer).startswith("ERROR:"):
-                db.cache_set(ckey, answer)
+        # Route through the SAME get_ai_answer() used by Telegram/WhatsApp so
+        # the numerical-never-cache rule, semantic cache, and language
+        # namespacing all apply consistently here too (this used to have its
+        # own simpler cache-only logic that skipped all three).
+        web_lang = db.get_language(uid)
+        web_numerical = tool in _NEVER_CACHE_TOOLS or is_numerical_question(q)
+        pre_cached = None
+        if not web_numerical:
+            pre_cached = db.cache_get(make_cache_key(tool, q, is_pro, web_lang))
+        answer = get_ai_answer(q, tool, is_pro, language=web_lang,
+                               phone_number=udata.get("phone_number", supplied_phone),
+                               exam_type=udata.get("exam_type", data.get("exam_type", "")),
+                               subject=udata.get("subject", data.get("subject", "")))
+        cached = bool(pre_cached)
     elapsed = time.time() - start
     soft = "Target almost locked" in str(answer or "")
     if (not answer) or str(answer).startswith("ERROR:") or soft:
@@ -3148,19 +5646,30 @@ def web_ask():
                 "15–20 second baad dubara **Fire** dabao — zyada tar sawaal tab clear ho jaate hain.\n\n"
                 "Tip: simple / short sawaal try karo, ya thodi der baad.\n"
                 "Pro plan = unlimited + priority.\n\n"
-                "- made with love by Sparsh Singhal"
+                + config.CONTENT["footer_signature"].format(creator_name=config.CREATOR_NAME)
             )
         })
     if not is_pro:
         pass  # already consumed atomically above via try_consume_quota
-    xp_gain = config.XP_QUESTION * (2 if is_pro else 1)
+    udata = db.get_user(uid) or udata
+    ex, sub = guess_exam_subject(q, data.get("exam_type") or udata.get("exam_type", ""), data.get("subject") or udata.get("subject", ""))
+    udata["exam_type"], udata["subject"], udata["last_question_at"] = ex, sub, _now_ist().isoformat()
+    db.save_user(uid, udata); db.sync_user_to_supabase(uid, udata)
+    db.add_personal_history(uid, q, tool=tool, exam_type=ex, subject=sub, source_cache=("redis" if cached else "ai"))
+    try:
+        schedule_spaced_reminders(uid, q, tool)
+    except Exception:
+        pass
+    xp_gain = config.XP_QUESTION * (config.PRO_XP_MULTIPLIER if is_pro else 1)
     xp, level = db.add_xp(uid, xp_gain)
+    streak_info = db.update_streak(uid)  # was missing on web — Telegram/WhatsApp already did this
     try:
         if db.redis:
             db.redis.hincrby(db._key(uid), "questions_asked", 1)
             db.redis.incr("stats:total_questions")
     except Exception:
         pass
+    db.sync_user_to_supabase(uid)
     _, quota = db.check_quota(uid)
     rank = db.get_rank(uid)
     footer = (
@@ -3168,15 +5677,536 @@ def web_ask():
         f"⚡ {elapsed:.1f}s"
         f"{' | 📦 cache' if cached else ''}"
         f" | 🛠️ {tool}"
-        f" | ⭐ +{xp_gain} XP{' (2× Pro)' if is_pro else ''} | Level {level}\n"
-        f"- made with love by Sparsh Singhal"
+        f" | ⭐ +{xp_gain} XP{' (2× Pro)' if is_pro else ''} | Level {level}"
+        f" | 🔥 {streak_info.get('current', 0)} din\n"
+        + config.CONTENT["footer_signature"].format(creator_name=config.CREATOR_NAME)
     )
-    return jsonify({"answer": answer + footer, "xp": xp, "level": level, "rank": rank, "quota": quota, "elapsed": round(elapsed, 2), "cached": cached})
+    resources = _10in1_metadata(q, is_pro, uid)
+    return jsonify({"answer": answer + footer, "xp": xp, "level": level, "rank": rank, "quota": quota,
+                     "elapsed": round(elapsed, 2), "cached": cached, "numerical": web_numerical,
+                     "coins": db.get_coins(uid), "language": db.get_language(uid), "streak": streak_info,
+                     "resources": resources, "brand": BRAND_NAME,
+                     "plan_compare": {
+            "free": config.PRODUCT_TEXT["free_plan_compare"].format(
+                free_daily=config.FREE_DAILY, free_pdf_per_day=config.FREE_PDF_PER_DAY,
+                free_video_links=config.FREE_VIDEO_LINKS, free_assignment_per_day=config.FREE_ASSIGNMENT_PER_DAY
+            ),
+            "pro": config.PRODUCT_TEXT["pro_plan_compare"].format(
+                pro_video_links=config.PRO_VIDEO_LINKS, pro_viva_questions=config.PRO_VIVA_QUESTIONS
+            )
+        }})
 
 
 @app.route("/api/leaderboard")
 def api_leaderboard():
     return jsonify({"board": db.get_leaderboard(15), "live": True})
+
+
+@app.route("/api/leaderboard/referrals")
+def api_referral_leaderboard():
+    """POINT 25 — 'Referral Raja' board."""
+    return jsonify({"board": db.get_referral_leaderboard(10)})
+
+
+@app.route("/api/set-phone", methods=["POST"])
+def api_set_phone():
+    data = request.get_json(silent=True) or {}
+    client_id = (data.get("client_id") or "").strip()
+    phone = normalize_phone(data.get("phone_number") or data.get("phone") or "")
+    if not client_id or not phone:
+        return jsonify({"ok": False, "error": "client_id and valid phone_number required"}), 400
+    uid = f"web:{client_id}"
+    db.ensure_user(uid, full_name=config.DEFAULT_STUDENT_NAMES["web"], platform="web")
+    ok = db.set_phone_number(uid, phone)
+    return jsonify({"ok": bool(ok), "phone_number": phone if ok else None})
+
+
+@app.route("/api/set-exam-type", methods=["POST"])
+def api_set_exam_type():
+    data = request.get_json(silent=True) or {}
+    client_id = (data.get("client_id") or "").strip()
+    exam_type = (data.get("exam_type") or "general").strip().lower()
+    subject = (data.get("subject") or "general").strip().lower()
+    if not client_id:
+        return jsonify({"ok": False, "error": "client_id required"}), 400
+    uid = f"web:{client_id}"
+    u = db.ensure_user(uid, full_name=config.DEFAULT_STUDENT_NAMES["web"], platform="web", exam_type=exam_type, subject=subject)
+    u["exam_type"], u["subject"] = exam_type[:64], subject[:64]
+    db.save_user(uid, u); db.sync_user_to_supabase(uid, u)
+    return jsonify({"ok": True, "exam_type": u["exam_type"], "subject": u["subject"]})
+
+
+@app.route("/api/supabase/status")
+def api_supabase_status():
+    return jsonify({"enabled": bool(supa.enabled), "url_configured": bool(config.SUPABASE_URL), "secret_configured": bool(config.SUPABASE_SECRET_KEY)})
+
+
+@app.route("/api/set-language", methods=["POST"])
+def api_set_language():
+    """POINT 24 — Hindi / Hinglish / English preference."""
+    data = request.get_json(silent=True) or {}
+    client_id = (data.get("client_id") or "").strip()
+    lang = (data.get("language") or "hinglish").strip().lower()
+    if not client_id:
+        return jsonify({"ok": False, "error": "client_id required"}), 400
+    uid = f"web:{client_id}"
+    db.ensure_user(uid, full_name=config.DEFAULT_STUDENT_NAMES["web"], platform="web")
+    ok = db.set_language(uid, lang)
+    return jsonify({"ok": bool(ok), "language": db.get_language(uid)})
+
+
+@app.route("/api/set-exam-date", methods=["POST"])
+def api_set_exam_date():
+    """POINT 30 — Exam Bomb: student tells us their exam date, we remind
+    them 24h before via the /api/cron/exam-bomb job."""
+    data = request.get_json(silent=True) or {}
+    client_id = (data.get("client_id") or "").strip()
+    exam_date = (data.get("exam_date") or "").strip()  # YYYY-MM-DD
+    subject = (data.get("subject") or "").strip()
+    exam_type = (data.get("exam_type") or "").strip().lower()
+    if not client_id or not exam_date:
+        return jsonify({"ok": False, "error": "client_id and exam_date required"}), 400
+    try:
+        datetime.strptime(exam_date, DATE_FORMAT)
+    except Exception:
+        return jsonify({"ok": False, "error": "exam_date must be YYYY-MM-DD"}), 400
+    uid = f"web:{client_id}"
+    db.ensure_user(uid, full_name=config.DEFAULT_STUDENT_NAMES["web"], platform="web")
+    ok = db.set_exam_date(uid, exam_date, subject)
+    if exam_type:
+        u = db.get_user(uid) or db.ensure_user(uid, full_name=config.DEFAULT_STUDENT_NAMES["web"], platform="web")
+        u["exam_type"] = exam_type; u["subject"] = subject or u.get("subject", "general")
+        db.save_user(uid, u); db.sync_user_to_supabase(uid, u)
+    return jsonify({"ok": bool(ok)})
+
+
+@app.route("/api/set-parent-phone", methods=["POST"])
+def api_set_parent_phone():
+    """POINT 26 — save parent's WhatsApp number for weekly reports."""
+    data = request.get_json(silent=True) or {}
+    client_id = (data.get("client_id") or "").strip()
+    phone = (data.get("phone") or "").strip()
+    if not client_id or not phone:
+        return jsonify({"ok": False, "error": "client_id and phone required"}), 400
+    uid = f"web:{client_id}"
+    db.ensure_user(uid, full_name=config.DEFAULT_STUDENT_NAMES["web"], platform="web")
+    ok = db.set_parent_phone(uid, phone)
+    return jsonify({"ok": bool(ok)})
+
+
+# ----------------------------------------------------------------------
+# GALTI DIARY — mistake tracker (POINT 32)
+# ----------------------------------------------------------------------
+@app.route("/api/galti-diary")
+def api_galti_diary():
+    client_id = (request.args.get("client_id") or "").strip()
+    if not client_id:
+        return jsonify({"ok": False, "error": "client_id required"}), 400
+    uid = f"web:{client_id}"
+    mistakes = db.get_mistakes(uid, limit=int(request.args.get("limit", 20)))
+    return jsonify({"ok": True, "mistakes": mistakes})
+
+
+@app.route("/api/galti-diary/clear", methods=["POST"])
+def api_galti_diary_clear():
+    data = request.get_json(silent=True) or {}
+    client_id = (data.get("client_id") or "").strip()
+    index = data.get("index")
+    if not client_id or index is None:
+        return jsonify({"ok": False, "error": "client_id and index required"}), 400
+    uid = f"web:{client_id}"
+    ok = db.clear_mistake(uid, int(index))
+    return jsonify({"ok": ok})
+
+
+# ----------------------------------------------------------------------
+# QUIZ SYSTEM (POINT 10) — Practice / Exam / 1v1-challenge modes.
+# FREE: 1 quiz/day, 3 questions, score only.
+# PRO: unlimited, any topic or built from the Galti Diary, full
+#      per-question explanations + weak-topic analysis, lifelines.
+# ----------------------------------------------------------------------
+@app.route("/api/quiz/generate", methods=["POST"])
+def api_quiz_generate():
+    data = request.get_json(silent=True) or {}
+    client_id = (data.get("client_id") or "").strip()
+    topic = (data.get("topic") or "").strip()
+    mode = (data.get("mode") or "practice").strip().lower()
+    use_galti_diary = bool(data.get("use_galti_diary"))
+    if not client_id:
+        return jsonify({"ok": False, "error": "client_id required"}), 400
+    if not topic and not use_galti_diary:
+        return jsonify({"ok": False, "error": "topic required"}), 400
+
+    uid = f"web:{client_id}"
+    db.ensure_user(uid, full_name=config.DEFAULT_STUDENT_NAMES["web"], platform="web")
+    is_pro = db.is_pro(uid)
+
+    if not is_pro:
+        if db.get_daily_quiz_used(uid):
+            return jsonify({"ok": False, "error": "Free daily quiz limit reached. Upgrade for unlimited quizzes.",
+                             "upsell": True}), 403
+        if mode != "practice":
+            return jsonify({"ok": False, "error": "Exam mode and 1v1 challenges are Pro-only.", "upsell": True}), 403
+        n_questions = 3
+    else:
+        n_questions = max(1, min(int(data.get("n_questions", 10)), 20))
+
+    source_context = ""
+    if use_galti_diary:
+        mistakes = db.get_mistakes(uid, limit=15)
+        if not mistakes:
+            return jsonify({"ok": False, "error": "Galti Diary khaali hai — pehle kuch sawaal galat karo! 😄"}), 400
+        topic = topic or "student's recent mistakes"
+        source_context = "\n".join(f"- {m.get('question','')} (topic: {m.get('topic','')})" for m in mistakes)
+
+    language = db.get_language(uid)
+    questions = ai.generate_quiz(topic, n_questions=n_questions, language=language, source_context=source_context)
+    if not questions:
+        return jsonify({"ok": False, "error": "Quiz generate nahi ho paya, dobara try karo."}), 502
+
+    quiz_id = secrets.token_hex(8)
+    db.save_quiz(quiz_id, {
+        "quiz_id": quiz_id, "owner_uid": uid, "topic": topic, "mode": mode,
+        "language": language, "questions": questions, "created_at": _today_ist(),
+        "is_pro": is_pro, "lifelines_used": {}, "skipped": [],
+    })
+    if not is_pro:
+        db.mark_daily_quiz_used(uid)
+
+    # Never leak the "correct" index / explanation / hint to the client up-front.
+    public_questions = [{"q": q["q"], "options": q["options"]} for q in questions]
+    return jsonify({
+        "ok": True, "quiz_id": quiz_id, "topic": topic, "mode": mode,
+        "questions": public_questions,
+        "lifelines": {"fifty_fifty": is_pro, "skip": is_pro, "hint": is_pro},
+        "timer_per_question_sec": 45 if mode == "exam" else None,
+    })
+
+
+@app.route("/api/quiz/lifeline", methods=["POST"])
+def api_quiz_lifeline():
+    """POINT 10 — 50:50 / Skip / Hint, Pro-only. Server decides what to
+    reveal so the client never holds the answer key up front."""
+    data = request.get_json(silent=True) or {}
+    client_id = (data.get("client_id") or "").strip()
+    quiz_id = (data.get("quiz_id") or "").strip()
+    q_index = data.get("q_index")
+    lifeline_type = (data.get("type") or "").strip().lower()
+    if not client_id or not quiz_id or q_index is None or lifeline_type not in ("fifty_fifty", "hint", "skip"):
+        return jsonify({"ok": False, "error": "client_id, quiz_id, q_index, and a valid type are required"}), 400
+
+    uid = f"web:{client_id}"
+    if not db.is_pro(uid):
+        return jsonify({"ok": False, "error": "Lifelines Pro-only hain.", "upsell": True}), 403
+
+    quiz = db.get_quiz(quiz_id)
+    if not quiz or quiz.get("owner_uid") != uid:
+        return jsonify({"ok": False, "error": "Quiz expired or not found"}), 404
+
+    q_index = int(q_index)
+    questions = quiz.get("questions", [])
+    if q_index < 0 or q_index >= len(questions):
+        return jsonify({"ok": False, "error": "Invalid question index"}), 400
+
+    lifelines_used = quiz.get("lifelines_used") or {}
+    used_key = f"{q_index}:{lifeline_type}"
+    if used_key in lifelines_used:
+        return jsonify({"ok": False, "error": "Ye lifeline is sawaal pe already use ho chuki hai"}), 400
+
+    q = questions[q_index]
+    result: Dict[str, Any] = {"ok": True, "type": lifeline_type}
+
+    if lifeline_type == "fifty_fifty":
+        wrong_indices = [i for i in range(len(q.get("options", []))) if i != q.get("correct", 0)]
+        random.shuffle(wrong_indices)
+        eliminate = wrong_indices[:max(0, len(wrong_indices) - 1)]  # leave exactly 1 wrong + correct
+        result["eliminate_indices"] = eliminate
+    elif lifeline_type == "hint":
+        result["hint"] = q.get("hint") or "Concept ko dobara padho — options mein se sabse specific wala try karo."
+    elif lifeline_type == "skip":
+        skipped = quiz.get("skipped") or []
+        if q_index not in skipped:
+            skipped.append(q_index)
+        quiz["skipped"] = skipped
+
+    lifelines_used[used_key] = True
+    quiz["lifelines_used"] = lifelines_used
+    db.save_quiz(quiz_id, quiz)
+    return jsonify(result)
+
+
+@app.route("/api/quiz/submit", methods=["POST"])
+def api_quiz_submit():
+    """Grade a completed quiz attempt, push wrong answers into the Galti
+    Diary, and return per-question feedback + a simple weak-topic verdict."""
+    data = request.get_json(silent=True) or {}
+    client_id = (data.get("client_id") or "").strip()
+    quiz_id = (data.get("quiz_id") or "").strip()
+    answers = data.get("answers") or []  # list of selected option indices (-1 = skipped)
+    if not client_id or not quiz_id:
+        return jsonify({"ok": False, "error": "client_id and quiz_id required"}), 400
+
+    uid = f"web:{client_id}"
+    quiz = db.get_quiz(quiz_id)
+    if not quiz:
+        return jsonify({"ok": False, "error": "Quiz expired or not found"}), 404
+
+    questions = quiz.get("questions", [])
+    skipped_set = set(quiz.get("skipped") or [])
+    results = []
+    score = 0
+    mistake_coins_total = 0
+    graded_total = 0  # skipped questions (via the Skip lifeline) don't count either way
+    for i, q in enumerate(questions):
+        picked = answers[i] if i < len(answers) else -1
+        correct_idx = q.get("correct", 0)
+        was_skipped = i in skipped_set
+        if was_skipped:
+            results.append({
+                "q": q.get("q", ""), "picked": -1, "correct": correct_idx,
+                "is_correct": None, "skipped": True, "explanation": q.get("explanation", ""),
+            })
+            continue
+        graded_total += 1
+        is_correct = (picked == correct_idx)
+        db.record_answer_outcome(uid, is_correct)
+        if is_correct:
+            score += 1
+        else:
+            correct_text = (q.get("options") or [""])[correct_idx] if correct_idx < len(q.get("options", [])) else ""
+            user_text = (q.get("options") or [""])[picked] if 0 <= picked < len(q.get("options", [])) else "skipped"
+            mistake_coins_total += db.add_mistake(
+                uid, question=q.get("q", ""), tool="quiz",
+                correct_answer=correct_text, user_answer=user_text, topic=quiz.get("topic", ""),
+            )
+            db.add_personal_history(uid, q.get("q", ""), tool="quiz", subject=quiz.get("topic", ""),
+                                    user_answer=user_text, correct_answer=correct_text, is_correct=False,
+                                    error_reason="quiz_answer_wrong")
+        if is_correct:
+            db.add_personal_history(uid, q.get("q", ""), tool="quiz", subject=quiz.get("topic", ""),
+                                    user_answer=(q.get("options") or [""])[picked] if 0 <= picked < len(q.get("options", [])) else "",
+                                    correct_answer=(q.get("options") or [""])[correct_idx] if correct_idx < len(q.get("options", [])) else "",
+                                    is_correct=True)
+        results.append({
+            "q": q.get("q", ""), "picked": picked, "correct": correct_idx,
+            "is_correct": is_correct, "skipped": False, "explanation": q.get("explanation", ""),
+        })
+
+    total = graded_total
+    db.save_quiz_attempt(uid, quiz_id, score, total, topic=quiz.get("topic", ""), mode=quiz.get("mode", "practice"))
+    is_pro = db.is_pro(uid)
+    xp_gain = 100 if (total and score == total) else int(20 * (score / total)) if total else 0
+    coins_gain = config.QUIZ_PERFECT_COINS if (total and score == total) else int(10 * (score / total)) if total else 0
+    if xp_gain:
+        db.add_xp(uid, xp_gain)
+    if coins_gain:
+        db.add_coins(uid, coins_gain)
+    coins_gain += mistake_coins_total  # POINT 32: small bonus per logged mistake, already credited above
+
+    pct_wrong = round(100 * (total - score) / total, 1) if total else 0
+    verdict = (
+        f"Tera {quiz.get('topic','is topic')} thoda weak hai, {pct_wrong}% galat kiya. Galti Diary check kar 📖"
+        if pct_wrong >= 40 else
+        f"Solid! {quiz.get('topic','is topic')} mein sirf {pct_wrong}% galti hui 🔥"
+    )
+
+    if quiz.get("mode") == "1v1":
+        player_name = (db.get_user(uid) or {}).get("full_name", config.DEFAULT_STUDENT_NAMES["generic"])
+        db.record_challenge_result(quiz_id, uid, player_name, score, total)
+
+    return jsonify({
+        "ok": True, "score": score, "total": total, "results": results,
+        "xp_gain": xp_gain, "coins_gain": coins_gain, "verdict": verdict,
+        "is_pro": is_pro, "coins_total": db.get_coins(uid),
+    })
+
+
+@app.route("/api/quiz/join/<quiz_id>")
+def api_quiz_join(quiz_id):
+    """POINT 10 — 1v1 challenge: a friend opens the shared link and plays
+    the exact same question set as the original quiz_id, independently."""
+    quiz = db.get_quiz(quiz_id)
+    if not quiz or quiz.get("mode") != "1v1":
+        return jsonify({"ok": False, "error": "Challenge not found or expired"}), 404
+    public_questions = [{"q": q["q"], "options": q["options"]} for q in quiz.get("questions", [])]
+    return jsonify({
+        "ok": True, "quiz_id": quiz_id, "topic": quiz.get("topic", ""), "mode": "1v1",
+        "questions": public_questions,
+        "lifelines": {"fifty_fifty": False, "skip": False, "hint": False},  # joiners play it straight
+        "timer_per_question_sec": None,
+    })
+
+
+@app.route("/api/quiz/challenge/<quiz_id>")
+def api_quiz_challenge_results(quiz_id):
+    return jsonify({"ok": True, "results": db.get_challenge_results(quiz_id)})
+
+
+@app.route("/api/quiz/history")
+def api_quiz_history():
+    client_id = (request.args.get("client_id") or "").strip()
+    if not client_id:
+        return jsonify({"ok": False, "error": "client_id required"}), 400
+    uid = f"web:{client_id}"
+    if not db.redis:
+        return jsonify({"ok": True, "history": []})
+    try:
+        raw = db.redis.lrange(f"quizhist:{uid}", 0, 19)
+        history = [json.loads(r) for r in raw]
+    except Exception:
+        history = []
+    return jsonify({"ok": True, "history": history})
+
+
+# ----------------------------------------------------------------------
+# TEACHER DASHBOARD (POINT 27)
+# ----------------------------------------------------------------------
+@app.route("/api/teacher/create-class", methods=["POST"])
+def api_teacher_create_class():
+    data = request.get_json(silent=True) or {}
+    client_id = (data.get("client_id") or "").strip()
+    class_name = (data.get("class_name") or "").strip()
+    if not client_id:
+        return jsonify({"ok": False, "error": "client_id required"}), 400
+    teacher_uid = f"web:{client_id}"
+    db.ensure_user(teacher_uid, full_name="Teacher", platform="web")
+    code = db.create_class_code(teacher_uid, class_name)
+    return jsonify({"ok": True, "class_code": code, "join_link": f"/?join_class={code}"})
+
+
+@app.route("/api/teacher/classes")
+def api_teacher_classes():
+    client_id = (request.args.get("client_id") or "").strip()
+    if not client_id:
+        return jsonify({"ok": False, "error": "client_id required"}), 400
+    teacher_uid = f"web:{client_id}"
+    codes = db.get_teacher_classes(teacher_uid)
+    classes = [db.get_class_info(c) for c in codes]
+    return jsonify({"ok": True, "classes": [c for c in classes if c]})
+
+
+@app.route("/api/join-class", methods=["POST"])
+def api_join_class():
+    data = request.get_json(silent=True) or {}
+    client_id = (data.get("client_id") or "").strip()
+    code = (data.get("code") or "").strip()
+    if not client_id or not code:
+        return jsonify({"ok": False, "error": "client_id and code required"}), 400
+    uid = f"web:{client_id}"
+    db.ensure_user(uid, full_name=config.DEFAULT_STUDENT_NAMES["web"], platform="web")
+    ok = db.join_class(uid, code)
+    if not ok:
+        return jsonify({"ok": False, "error": "Invalid class code"}), 404
+    return jsonify({"ok": True, "class_code": code.upper()})
+
+
+@app.route("/api/teacher/class/<code>")
+def api_teacher_class_detail(code):
+    info = db.get_class_info(code)
+    if not info:
+        return jsonify({"ok": False, "error": "Class not found"}), 404
+    return jsonify({"ok": True, **info})
+
+
+# ----------------------------------------------------------------------
+# CRON JOBS (POINTS 7, 26, 30) — call these from Vercel Cron / an
+# external scheduler, protected by DEV_SECRET so randoms can't trigger
+# mass WhatsApp sends. Configure with a header or ?code=... query param.
+# ----------------------------------------------------------------------
+def _cron_authorized() -> bool:
+    if not config.DEV_SECRET:
+        return False
+    supplied = request.args.get("code") or request.headers.get("X-Cron-Secret", "")
+    return hmac.compare_digest(supplied or "", config.DEV_SECRET)
+
+
+@app.route("/api/cron/parent-report", methods=["POST", "GET"])
+def cron_parent_report():
+    """POINT 26 — weekly WhatsApp report to parents. Run every Sunday 7PM IST."""
+    if not _cron_authorized():
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
+    if not db.redis:
+        return jsonify({"ok": False, "error": "no redis"}), 500
+    sent = 0
+    try:
+        for uid in db.redis.smembers("stats:users") or []:
+            u = db.get_user(uid)
+            phone = (u or {}).get("parent_phone", "")
+            if not phone:
+                continue
+            report = db.get_weekly_report(uid)
+            body = (
+                f"🎓 Namaste! {report['name']} ka SaarthiBhai weekly report:\n\n"
+                f"⭐ Level {report['level']} ({report['xp']} XP)\n"
+                f"🔥 Streak: {report['streak']} din\n"
+                f"📚 Total sawaal: {report['questions_asked']}\n"
+                + (f"📍 Rank: #{report['rank']}\n" if report.get('rank') else "")
+                + "\n- SaarthiBhai by Sparsh Singhal"
+            )
+            _send_whatsapp_text(phone, body)
+            sent += 1
+    except Exception as e:
+        logger.error("cron_parent_report: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True, "reports_sent": sent})
+
+
+@app.route("/api/cron/exam-bomb", methods=["POST", "GET"])
+def cron_exam_bomb():
+    """POINT 30 — 24h-before-exam formula sheet + weak-topics nudge."""
+    if not _cron_authorized():
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
+    sent = 0
+    try:
+        for u in db.get_users_with_exam_tomorrow():
+            uid = u.get("user_id")
+            subject = u.get("exam_subject") or "kal ka exam"
+            mistakes = db.get_mistakes(uid, limit=5)
+            weak_list = "\n".join(f"- {m.get('question','')[:80]}" for m in mistakes) or "Koi saved mistakes nahi — solid prep!"
+            body = (
+                f"🎯 Bhai kal {subject} ka exam hai na?\n\n"
+                f"Tere weak sawaal (Galti Diary se):\n{weak_list}\n\n"
+                "All the best — SaarthiBhai tumhare saath hai 💪"
+            )
+            if u.get("platform") == "whatsapp" and uid.startswith("wa:"):
+                _send_whatsapp_text(uid.replace("wa:", ""), body)
+                sent += 1
+    except Exception as e:
+        logger.error("cron_exam_bomb: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True, "reminders_sent": sent})
+
+
+@app.route("/legal")
+def legal_page():
+    """POINT 19/42 — Fair Use + DMCA notice, content mostly static but the
+    contact email comes from ENV so it's not hardcoded per deployment."""
+    dmca_email = config.COPYRIGHT_CONTACT
+    html = f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Legal — SaarthiBhai</title>
+<style>body{{font-family:system-ui,sans-serif;background:#0b1220;color:#f1f5f9;max-width:720px;margin:2rem auto;padding:1.5rem;line-height:1.7}}
+h1{{color:#22d3ee}}h2{{color:#22d3ee;font-size:1.05rem;margin-top:1.5rem}}a{{color:#22d3ee}}</style></head><body>
+<h1>SaarthiBhai — Legal &amp; Fair Use</h1>
+<p>SaarthiBhai (by Sparsh Singhal) is an educational assistant. We do not host or distribute
+full scanned textbooks, question papers, or other copyrighted works. Any reference material is
+summarized in our own words, with source attribution (chapter/page) shown for transparency, not
+as a substitute for the original book.</p>
+<h2>Fair Use</h2>
+<p>Short, attributed summaries and explanations of educational material, generated to help
+students study, are provided under a good-faith fair-use understanding. We do not claim this
+constitutes formal legal advice.</p>
+<h2>Academic Integrity</h2>
+<p>SaarthiBhai will not assist with live exam-hall cheating or impersonation. It is a study and
+revision tool, not an exam-taking tool.</p>
+<h2>DMCA / Copyright Takedown</h2>
+<p>If you believe content on SaarthiBhai infringes your copyright, email
+<a href="mailto:{dmca_email}">{dmca_email}</a> with the material in question and proof of
+ownership. We aim to review and remove valid claims within 24 hours.</p>
+<p style="margin-top:2rem;color:#94a3b8;font-size:.85rem">— made with ❤️ by Sparsh Singhal</p>
+</body></html>"""
+    from flask import Response
+    return Response(html, mimetype="text/html")
 
 
 @app.route("/api/dev/stats")
@@ -3222,7 +6252,7 @@ def dev_real_pro():
             if currently_pro:
                 real.append({
                     "uid": str(uid),
-                    "name": u.get("full_name", "Student")[:40],
+                    "name": u.get("full_name", config.DEFAULT_STUDENT_NAMES["generic"])[:40],
                     "platform": u.get("platform", "?"),
                     "pro_until": u.get("pro_until", ""),
                     "questions": int(u.get("questions_asked", 0) or 0),
@@ -3318,7 +6348,15 @@ def razorpay_webhook():
         if not hmac.compare_digest(expected, received_sig):
             return jsonify({"ok": False}), 400
         payload = request.get_json(force=True)
-        if payload.get("event") == "payment.captured":
+        event_name = payload.get("event", "")
+        if event_name in ("refund.created", "refund.processed"):
+            entity = payload.get("payload", {}).get("refund", {}).get("entity", {}) or {}
+            refund_id = entity.get("id", "")
+            payment_id = entity.get("payment_id", "")
+            refund_amount = int(entity.get("amount") or 0)
+            result = process_refund(refund_id, payment_id, refund_amount)
+            return jsonify(result if result.get("ok") else {"ok": False, "error": result.get("error", "refund failed")}), (200 if result.get("ok") else 400)
+        if event_name == "payment.captured":
             entity = payload.get("payload", {}).get("payment", {}).get("entity", {})
             payment_id = entity.get("id", "")
             notes = entity.get("notes", {}) or {}
@@ -3327,6 +6365,13 @@ def razorpay_webhook():
                 return jsonify({"ok": True, "duplicate": True})
             if uid:
                 db.activate_pro(uid, days=30)
+                try:
+                    pu = db.get_user(uid) or {}
+                    pu["last_payment_id"] = payment_id
+                    db.save_user(uid, pu)
+                    db.sync_user_to_supabase(uid, pu)
+                except Exception:
+                    pass
                 db.add_badge(uid, "Pro Warrior 👑")
                 logger.info("Pro activated for %s", uid)
         return jsonify({"ok": True})
@@ -3393,12 +6438,55 @@ def telegram_webhook():
         return jsonify({"ok": False}), 500
 
 
+@app.route("/api/setup-supabase")
+def setup_supabase():
+    """Safe helper: returns the checked-in schema text; DB creation itself is intentionally
+    performed in the Supabase SQL editor or migration pipeline."""
+    sql_path = os.path.join(os.path.dirname(__file__), "supabase_schema.sql")
+    try:
+        with open(sql_path, "r", encoding="utf-8") as f:
+            return f"<pre>{f.read()}</pre>", 200, {"Content-Type": "text/html; charset=utf-8"}
+    except Exception:
+        return jsonify({"ok": False, "error": "supabase_schema.sql not found in deployment"}), 404
+
+
+@app.route("/api/dev/library-upsert", methods=["POST"])
+def dev_library_upsert():
+    if not config.DEV_SECRET or not hmac.compare_digest(request.headers.get("X-Dev-Secret", ""), config.DEV_SECRET):
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
+    data = request.get_json(silent=True) or {}
+    title = (data.get("title") or "").strip()
+    content = (data.get("content") or "").strip()
+    if not title or not content:
+        return jsonify({"ok": False, "error": "title and content required"}), 400
+    source_type = (data.get("source_type") or "notes").strip().lower()
+    if source_type in {"full_book_photo", "full_book_scan", "pirated_book", "paper_leak", "exam_leak"} or "leak" in source_type:
+        return jsonify({"ok": False, "error": "SaarthiBhai library me full copyrighted scans/paper leaks allowed nahi hain."}), 400
+    row = {
+        "title": title[:300], "content": content[:500000],
+        "source_type": source_type[:64],
+        "exam_type": (data.get("exam_type") or "general")[:64],
+        "subject": (data.get("subject") or "general")[:64],
+        "class_name": (data.get("class_name") or "")[:64],
+        "chapter": (data.get("chapter") or "")[:200],
+        "author": (data.get("author") or "")[:200],
+        "url": (data.get("url") or "")[:1000],
+        "license": (data.get("license") or "")[:300],
+        "is_public": bool(data.get("is_public", True)),
+        "metadata": data.get("metadata") if isinstance(data.get("metadata"), dict) else {},
+    }
+    if not supa.enabled:
+        return jsonify({"ok": False, "error": "Supabase disabled"}), 503
+    ok = supa.insert("library", row)
+    return jsonify({"ok": bool(ok)})
+
+
 @app.route("/api/setup")
 def setup():
     if not config.VERCEL_URL or not config.BOT_TOKEN:
         return jsonify({"error": "Missing VERCEL_URL or BOT_TOKEN"}), 400
-    webhook_url = f"https://{config.VERCEL_URL.rstrip('/')}/api/webhook"
-    api = f"https://api.telegram.org/bot{config.BOT_TOKEN}/setWebhook"
+    webhook_url = f"{config.PUBLIC_SCHEME}://{config.VERCEL_URL.rstrip('/')}/api/webhook"
+    api = f"{config.URLS["telegram_base_url"]}/bot{config.BOT_TOKEN}/setWebhook"
     payload = {"url": webhook_url}
     if config.WEBHOOK_SECRET:
         payload["secret_token"] = config.WEBHOOK_SECRET
@@ -3469,10 +6557,1008 @@ def dev_activate_pro():
     })
 
 
+@app.route("/api/dev/unban", methods=["POST"])
+def dev_unban():
+    """POINT 3/19 admin escape hatch — a support agent (you) can lift a ban
+    early, e.g. a false-positive word match. Never exposed to end users."""
+    if not config.DEV_SECRET:
+        return jsonify({"ok": False, "error": "dev mode disabled"}), 403
+    data = request.get_json(silent=True) or {}
+    if not hmac.compare_digest((data.get("code") or ""), config.DEV_SECRET):
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
+    uid = (data.get("uid") or "").strip()
+    if not uid:
+        return jsonify({"ok": False, "error": "uid required"}), 400
+    ok = db.unban_user(uid)
+    return jsonify({"ok": bool(ok), "uid": uid, "unbanned": True})
+
+
+@app.route("/api/dev/abuse-status")
+def dev_abuse_status():
+    """Check a user's current warning count / ban status without unbanning."""
+    if not config.DEV_SECRET or not hmac.compare_digest(request.args.get("code", ""), config.DEV_SECRET):
+        return jsonify({"ok": False}), 403
+    uid = (request.args.get("uid") or "").strip()
+    if not uid:
+        return jsonify({"ok": False, "error": "uid required"}), 400
+    return jsonify({
+        "ok": True, "uid": uid,
+        "banned": db.is_banned(uid),
+        "ban_remaining_seconds": db.get_ban_remaining_seconds(uid),
+        "warning_count": db.get_abuse_warning_count(uid),
+    })
+
+
+# ============================================================================
+# SAARTHIBHAI v7 PRODUCT LAYER — points 1..41
+# ============================================================================
+
+# Locked branding: every server-generated surface uses this constant.
+FREE_UPSELL_LINE = config.FREE_UPSELL_LINE
+
+FEATURE_CATALOG_28 = list(config.FEATURE_CATALOG_28)
+TOOL_ALIASES = dict(config.TOOL_ALIASES)
+
+
+# Optional external services.
+YOUTUBE_API_KEY = config.YOUTUBE_API_KEY
+INSTAGRAM_ACCESS_TOKEN = config.INSTAGRAM_ACCESS_TOKEN
+INSTAGRAM_GRAPH_VERSION = config.INSTAGRAM_GRAPH_VERSION
+INSTAGRAM_ACCOUNT_ID = config.INSTAGRAM_ACCOUNT_ID
+INSTAGRAM_VERIFY_TOKEN = config.INSTAGRAM_VERIFY_TOKEN
+SNAPCHAT_ENABLED = config.SNAPCHAT_ENABLED
+SNAPCHAT_DM_GATEWAY_URL = config.SNAPCHAT_DM_GATEWAY_URL
+SNAPCHAT_DM_GATEWAY_TOKEN = config.SNAPCHAT_DM_GATEWAY_TOKEN
+CREATOR_PHOTO_URL = config.CREATOR_PHOTO_URL
+CREATOR_STORY_URL = config.CREATOR_STORY_URL
+
+# ---------------------------------------------------------------------------
+# Supabase utility operations added to the small REST wrapper.
+# ---------------------------------------------------------------------------
+def _sb_update(self, table: str, filters: dict, patch: dict) -> bool:
+    if not self.enabled or not filters or not patch:
+        return False
+    try:
+        params = {k: str(v) for k, v in filters.items()}
+        h = dict(self.headers)
+        h["Prefer"] = "return=minimal"
+        r = requests.patch(self._url(table), params=params, headers=h, json=patch, timeout=config.SUPABASE_TIMEOUT)
+        if r.status_code >= 300:
+            logger.warning("Supabase update %s %s: %s", table, r.status_code, r.text[:400])
+            return False
+        return True
+    except Exception as e:
+        logger.warning("Supabase update %s: %s", table, e)
+        return False
+
+
+def _sb_delete(self, table: str, filters: dict) -> bool:
+    if not self.enabled or not filters:
+        return False
+    try:
+        r = requests.delete(self._url(table), params=filters, headers=self.headers, timeout=config.SUPABASE_TIMEOUT)
+        return r.status_code < 300
+    except Exception as e:
+        logger.warning("Supabase delete %s: %s", table, e)
+        return False
+
+
+SupabaseStore.update = _sb_update
+SupabaseStore.delete = _sb_delete
+
+
+# ---------------------------------------------------------------------------
+# Phone is the canonical cross-platform identity in Redis as well as Supabase.
+# This makes coins/XP/streaks follow the student across web/WA/Telegram.
+# ---------------------------------------------------------------------------
+_ORIG_DB_KEY = Database._key
+_ORIG_ENSURE_USER = Database.ensure_user
+_ORIG_SET_PHONE = Database.set_phone_number
+_ORIG_ADD_COINS = Database.add_coins
+_ORIG_ADD_XP = Database.add_xp
+_ORIG_UPDATE_STREAK = Database.update_streak
+_ORIG_SYNC_SUPABASE = Database.sync_user_to_supabase
+_ORIG_SAVE_USER = Database.save_user
+
+
+def _canonical_uid(self, uid: str | int) -> str:
+    raw = str(uid)
+    if not self.redis:
+        return raw
+    try:
+        p = self.redis.get(f"identity:uid_phone:{raw}")
+        if p:
+            return f"phone:{normalize_phone(p)}"
+        if raw.startswith("wa:"):
+            p = normalize_phone(raw[3:])
+            if p:
+                return f"phone:{p}"
+        p2 = normalize_phone(raw) if re.fullmatch(r"\+?[0-9 ()-]{10,20}", raw) else ""
+        if p2:
+            return f"phone:{p2}"
+    except Exception:
+        pass
+    return raw
+
+
+def _v7_key(self, uid: str | int) -> str:
+    return f"user:{_canonical_uid(self, uid)}"
+
+
+def _bind_phone_identity(self, uid: str | int, phone: str) -> str:
+    p = normalize_phone(phone)
+    raw = str(uid)
+    if not p or not self.redis:
+        return raw
+    canonical = f"phone:{p}"
+    try:
+        existing = self.redis.hgetall(f"user:{raw}")
+        canonical_data = self.redis.hgetall(f"user:{canonical}")
+        if existing and not canonical_data:
+            self.redis.hset(f"user:{canonical}", mapping=existing)
+        self.redis.set(f"identity:uid_phone:{raw}", p)
+        self.redis.set(f"identity:phone_uid:{p}", raw)
+        self.redis.expire(f"identity:uid_phone:{raw}", 86400 * 3650)
+        self.redis.expire(f"identity:phone_uid:{p}", 86400 * 3650)
+    except Exception as e:
+        logger.debug("bind phone identity: %s", e)
+    return canonical
+
+
+def _v7_ensure_user(self, uid, username="", full_name="", platform="telegram", referred_by="", phone_number="", exam_type="", subject=""):
+    p = normalize_phone(phone_number or (str(uid)[3:] if str(uid).startswith("wa:") else ""))
+    if p:
+        _bind_phone_identity(self, uid, p)
+    user = _ORIG_ENSURE_USER(self, uid, username, full_name, platform, referred_by, phone_number, exam_type, subject)
+    if p:
+        user["phone_number"] = p
+    # Trial is evaluated on every login boundary too, so reaching 500 coins or
+    # 5 referrals unlocks Pro immediately rather than waiting for the next ask.
+    try:
+        self.maybe_grant_trial(uid)
+    except Exception:
+        pass
+    user = self.get_user(uid) or user
+    # Onboarding gift: exactly once — 50 coins + one freeze. Daily spin remains free.
+    if self.redis:
+        try:
+            key = self._key(uid)
+            if self.redis.hget(key, "onboarding_gift_claimed") != "1":
+                self.redis.hset(key, mapping={"onboarding_gift_claimed": "1", "shields": max(1, int(self.redis.hget(key, "shields") or 0))})
+        except Exception:
+            pass
+    self.sync_user_to_supabase(uid)
+    return self.get_user(uid) or user
+
+
+def _v7_save_user(self, uid, data):
+    # Preserve phone identity whenever a profile is saved.
+    phone = normalize_phone(data.get("phone_number", ""))
+    if phone:
+        _bind_phone_identity(self, uid, phone)
+    return _ORIG_SAVE_USER(self, uid, data)
+
+
+def _v7_set_phone(self, uid, phone_number):
+    p = normalize_phone(phone_number)
+    if not p:
+        return False
+    _bind_phone_identity(self, uid, p)
+    ok = _ORIG_SET_PHONE(self, uid, p)
+    if ok:
+        u = self.get_user(uid) or {}
+        u["phone_number"] = p
+        self.save_user(uid, u)
+        self.sync_user_to_supabase(uid, u)
+    return ok
+
+
+def _v7_sync(self, uid, user=None):
+    u = user or self.get_user(uid)
+    if u:
+        u.setdefault("learner_track", "competitive" if str(u.get("exam_type", "")).lower() in {
+            "jee","neet","upsc","ssc","banking","bpsc","gate","cat","cuet","nda","clat"
+        } else "school_college")
+        u.setdefault("onboarding_gift_claimed", "1")
+        u.setdefault("trial_granted", "0")
+        u.setdefault("telegram_chat_id", "")
+        u.setdefault("instagram_user_id", "")
+    ok = _ORIG_SYNC_SUPABASE(self, uid, u)
+    if self.supabase.enabled and u:
+        phone = normalize_phone(u.get("phone_number", ""))
+        if phone:
+            extra = {
+                "learner_track": u.get("learner_track", "school_college"),
+                "onboarding_gift_claimed": str(u.get("onboarding_gift_claimed", "1")).lower() in ("1","true","yes"),
+                "trial_granted": str(u.get("trial_granted", "0")).lower() in ("1","true","yes"),
+            "last_payment_id": u.get("last_payment_id", ""),
+            "refunded_at": u.get("refunded_at", "") or None,
+            "last_refund_id": u.get("last_refund_id", ""),
+                "telegram_chat_id": str(u.get("telegram_chat_id", "")),
+                "instagram_user_id": str(u.get("instagram_user_id", "")),
+            }
+            try:
+                _DB_WRITE_POOL.submit(self.supabase.upsert, "users", {"phone_number": phone, **extra}, "phone_number")
+            except Exception:
+                pass
+    return ok
+
+
+Database._key = _v7_key
+Database.ensure_user = _v7_ensure_user
+Database.save_user = _v7_save_user
+Database.set_phone_number = _v7_set_phone
+Database.sync_user_to_supabase = _v7_sync
+
+
+def _set_channel_identity(self, uid: str | int, field: str, value: str) -> bool:
+    u = self.get_user(uid) or self.ensure_user(uid)
+    if not u:
+        return False
+    u[field] = str(value or "")
+    return bool(self.save_user(uid, u) and self.sync_user_to_supabase(uid, u))
+
+
+Database.set_channel_identity = _set_channel_identity
+
+
+# Durable sync for all hot-wallet mutations.
+def _v7_add_coins(self, uid, amount):
+    bal = _ORIG_ADD_COINS(self, uid, amount)
+    try:
+        self.sync_user_to_supabase(uid)
+        self.maybe_grant_trial(uid)
+    except Exception:
+        pass
+    return bal
+
+
+def _v7_add_xp(self, uid, amount):
+    result = _ORIG_ADD_XP(self, uid, amount)
+    try:
+        self.sync_user_to_supabase(uid)
+    except Exception:
+        pass
+    return result
+
+
+def _v7_update_streak(self, uid):
+    result = _ORIG_UPDATE_STREAK(self, uid)
+    try:
+        self.sync_user_to_supabase(uid)
+    except Exception:
+        pass
+    return result
+
+
+Database.add_coins = _v7_add_coins
+Database.add_xp = _v7_add_xp
+Database.update_streak = _v7_update_streak
+
+
+def _maybe_grant_trial(self, uid: str | int) -> bool:
+    if not self.redis:
+        return False
+    try:
+        u = self.get_user(uid) or {}
+        if str(u.get("trial_granted", "0")).lower() in ("1", "true", "yes"):
+            return False
+        referrals = int(u.get("referral_count", 0) or 0)
+        coins = int(u.get("coins", 0) or 0)
+        if coins < config.TRIAL_COINS and referrals < config.TRIAL_REFERRALS:
+            return False
+        if not self.redis.set(f"trial:claim:{_canonical_uid(self, uid)}", "1", nx=True, ex=86400 * 3650):
+            return False
+        self.activate_pro(uid, days=config.TRIAL_DAYS)
+        u = self.get_user(uid) or {}
+        u["trial_granted"] = "1"
+        self.save_user(uid, u)
+        self.sync_user_to_supabase(uid, u)
+        return True
+    except Exception as e:
+        logger.warning("trial grant: %s", e)
+        return False
+
+
+Database.maybe_grant_trial = _maybe_grant_trial
+
+
+# ---------------------------------------------------------------------------
+# Reminder + mission + community verification storage helpers.
+# ---------------------------------------------------------------------------
+def _phone_for_uid(uid: str | int) -> str:
+    return normalize_phone((db.get_user(uid) or {}).get("phone_number", ""))
+
+
+def schedule_spaced_reminders(uid: str | int, question: str, tool: str = "general") -> None:
+    """1/3/7/15-day spaced review queue; durable in Supabase when phone exists."""
+    phone = _phone_for_uid(uid)
+    if not phone or not supa.enabled or not question:
+        return
+    base = _now_ist()
+    rows = []
+    for days in config.SPACED_REMINDER_DAYS:
+        rows.append({
+            "phone_number": phone,
+            "due_at": (base + timedelta(days=days)).isoformat(),
+            "offset_days": days,
+            "question": question[:4000],
+            "tool": (tool or "general")[:64],
+            "status": "pending",
+        })
+    def _write():
+        for row in rows:
+            try:
+                supa.insert("study_reminders", row)
+            except Exception:
+                pass
+    try:
+        _DB_WRITE_POOL.submit(_write)
+    except Exception:
+        _write()
+
+
+def schedule_spaced_reminders_phone(phone: str, question: str, tool: str = "general") -> None:
+    p = normalize_phone(phone)
+    if not p or not supa.enabled or not question:
+        return
+    base = _now_ist()
+    for days in config.SPACED_REMINDER_DAYS:
+        row = {"phone_number": p, "due_at": (base + timedelta(days=days)).isoformat(),
+               "offset_days": days, "question": question[:4000], "tool": (tool or "general")[:64], "status": "pending"}
+        try:
+            _DB_WRITE_POOL.submit(supa.insert, "study_reminders", row)
+        except Exception:
+            try: supa.insert("study_reminders", row)
+            except Exception: pass
+
+
+def daily_mission_for_user(uid: str | int) -> dict:
+    """One old PYQ + one formula daily mission; duration is config-driven."""
+    u = db.get_user(uid) or {}
+    ex = u.get("exam_type", "general")
+    sub = u.get("subject", "general")
+    mistakes = db.get_mistakes(uid, limit=3)
+    old_topic = (mistakes[0].get("topic") or mistakes[0].get("question", "")).strip() if mistakes else f"{sub} revision"
+    return {
+        "title": "3-Minute Daily Mission 🔥",
+        "exam_type": ex,
+        "subject": sub,
+        "pyq": f"1 purana PYQ: {old_topic[:120]}",
+        "formula": f"1 formula: aaj {sub} ka ek high-yield formula yaad karo.",
+        "duration_min": config.DAILY_MISSION_MINUTES,
+        "reward_coins": config.MISSION_REWARD_COINS,
+        "mission_id": f"{_today_ist()}:{ex}:{sub}",
+    }
+
+
+def _library_vote(uid: str, library_id: int, vote: int) -> bool:
+    phone = _phone_for_uid(uid)
+    if not phone or not supa.enabled:
+        return False
+    vote = 1 if int(vote or 0) > 0 else -1
+    row = {"library_id": int(library_id), "phone_number": phone, "vote": vote}
+    # Unique constraint makes this one-vote-per-child and safe to upsert.
+    return supa.upsert("library_votes", row, "library_id,phone_number")
+
+
+def _verify_library_item(library_id: int) -> dict:
+    if not supa.enabled:
+        return {"verified": False, "upvotes": 0, "downvotes": 0}
+    ups = len(supa.select_many("library_votes", {"library_id": f"eq.{int(library_id)}", "vote": "eq.1"}, limit=10000, columns="phone_number"))
+    downs = len(supa.select_many("library_votes", {"library_id": f"eq.{int(library_id)}", "vote": "eq.-1"}, limit=10000, columns="phone_number"))
+    verified = ups >= 3
+    try:
+        supa.update("library", {"id": f"eq.{int(library_id)}"}, {"upvotes": ups, "downvotes": downs, "verified": verified})
+    except Exception:
+        pass
+    return {"verified": verified, "upvotes": ups, "downvotes": downs}
+
+
+# ---------------------------------------------------------------------------
+# Answer polish: exact free upsell + 10-in-1 resource metadata.
+# ---------------------------------------------------------------------------
+def _free_upsell(answer: str, is_pro: bool) -> str:
+    if is_pro or not answer:
+        return answer or ""
+    return answer.rstrip() + "\n\n" + FREE_UPSELL_LINE
+
+
+def _youtube_links(topic: str, limit: int, language: str = "hinglish") -> list[dict]:
+    topic = (topic or "").strip()
+    if not topic:
+        return []
+    if YOUTUBE_API_KEY:
+        try:
+            r = requests.get(
+                config.URLS["youtube_api_url"],
+                params={"part":"snippet", "q":topic, "type":"video", "maxResults":max(1,min(limit,config.PRO_VIDEO_LINKS)), "key":YOUTUBE_API_KEY},
+                timeout=8,
+            )
+            if r.status_code < 300:
+                out = []
+                for item in (r.json().get("items") or []):
+                    vid = ((item.get("id") or {}).get("videoId") or "").strip()
+                    sn = item.get("snippet") or {}
+                    if vid:
+                        out.append({"title": str(sn.get("title") or config.PRODUCT_TEXT.get("resource_video_fallback_title", "Relevant video"))[:160], "url": f"{config.URLS["youtube_watch_base_url"]}{vid}"})
+                return out[:limit]
+        except Exception:
+            pass
+    # No API key: still give a topic-scoped YouTube result rather than an unrelated link.
+    return [{"title": f"YouTube: {topic}", "url": config.URLS["youtube_search_base_url"] + quote(topic)}]
+
+
+def _10in1_metadata(question: str, is_pro: bool, uid: str | int = "") -> dict:
+    links = _youtube_links(question, config.PRO_VIDEO_LINKS if is_pro else config.FREE_VIDEO_LINKS)
+    pdf_url = f"/api/export/pdf?question={quote((question or '')[:300])}&uid={quote(str(uid))}"
+    assignment_url = f"/api/resource/assignment?uid={quote(str(uid))}&topic={quote((question or '')[:300])}"
+    return {
+        "video_links": links,
+        "pdf_url": pdf_url,
+        "assignment_url": assignment_url,
+        "free_pro": {
+            "free": config.ANSWER_RESOURCE_COPY["free_pack"],
+            "pro": config.ANSWER_RESOURCE_COPY["pro_pack"],
+        },
+    }
+
+
+def _channel_resource_suffix(question: str, is_pro: bool, uid: str | int) -> str:
+    meta = _10in1_metadata(question, is_pro, uid)
+    lines = [config.ANSWER_RESOURCE_COPY["extras_heading"]]
+    videos = meta.get("video_links") or []
+    for v in videos[:config.PRO_VIDEO_LINKS if is_pro else config.FREE_VIDEO_LINKS]:
+        lines.append(f"▶️ {v.get('title','Relevant video')}: {v.get('url','')}")
+    lines.append(f"📄 Study PDF: {meta['pdf_url']}")
+    lines.append(f"📝 Full assignment: {meta['assignment_url']}")
+    if not is_pro:
+        lines.append(config.ANSWER_RESOURCE_COPY["free_badge"].format(
+            free_video_links=config.FREE_VIDEO_LINKS,
+            free_pdf_per_day=config.FREE_PDF_PER_DAY,
+            free_assignment_per_day=config.FREE_ASSIGNMENT_PER_DAY,
+            pro_video_links=config.PRO_VIDEO_LINKS,
+        ))
+    return "\n".join(lines)
+
+
+_ORIG_GET_AI_ANSWER = get_ai_answer
+
+def get_ai_answer_v7(question: str, tool: str, is_pro: bool, language: str = "hinglish",
+                     phone_number: str = "", exam_type: str = "", subject: str = ""):
+    # Exam integrity rule: refuse paper leaks / in-exam cheating while still helping with preparation.
+    low = (question or "").lower()
+    cheating_terms = ("paper leak", "leaked paper", "exam hall cheating", "cheat in exam", "phone in exam", "exam me cheating")
+    if any(x in low for x in cheating_terms):
+        return (
+            "Bhai exam me phone ya cheating nahi. 📵❤️\n\n"
+            "Main leak ya live cheating me help nahi karunga, but abhi isi topic ka 10-minute revision, formula sheet, "
+            "PYQ-style practice ya mock bana deta hoon. Bas topic bhej."
+        )
+    # Emotional support mode — kind, non-judgmental, no diagnosis.
+    crisis_terms = ("suicide", "kill myself", "marna chahta", "marna chahti", "jeena nahi", "self harm", "khud ko nuksan")
+    if any(x in low for x in crisis_terms):
+        return (
+            "Arre bhai/behen, pehle padhai side pe rakhte hain. ❤️\n\n"
+            "Tu akela nahi hai. Abhi kisi trusted adult, parent, teacher ya close dost ko bata aur unke paas reh. "
+            "Agar tujhe lag raha hai ki tu khud ko hurt kar sakta/sakti hai, turant local emergency service ya nearest hospital ki help le. "
+            "Mujhe bas ek cheez bata: **abhi tu safe jagah par hai aur kisi apne ke paas hai?**"
+        )
+    canonical = TOOL_ALIASES.get(tool, tool)
+    q = question
+    if tool != canonical:
+        q = f"Feature mode: {tool}. Do the requested study task using this mode.\n\n{question}"
+    ans = _ORIG_GET_AI_ANSWER(q, canonical, is_pro, language=language, phone_number=phone_number, exam_type=exam_type, subject=subject)
+    if ans and not str(ans).startswith("ERROR:"):
+        ans = _free_upsell(ans, is_pro)
+    return ans
+
+
+get_ai_answer = get_ai_answer_v7
+
+
+# ---------------------------------------------------------------------------
+# Channel senders / webhook aliases.
+# ---------------------------------------------------------------------------
+def _send_telegram_text(chat_id: str, body: str) -> bool:
+    if not config.BOT_TOKEN or not chat_id:
+        return False
+    try:
+        r = requests.post(
+            f"{config.URLS["telegram_base_url"]}/bot{config.BOT_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": body[:4000], "disable_web_page_preview": False},
+            timeout=10,
+        )
+        return r.status_code < 300
+    except Exception as e:
+        logger.warning("Telegram cron send: %s", e)
+        return False
+
+
+def _send_instagram_text(recipient_id: str, body: str) -> bool:
+    if not INSTAGRAM_ACCESS_TOKEN or not INSTAGRAM_ACCOUNT_ID or not recipient_id:
+        return False
+    try:
+        url = f"{config.URLS["instagram_graph_base_url"]}/{INSTAGRAM_GRAPH_VERSION}/{INSTAGRAM_ACCOUNT_ID}/messages"
+        r = requests.post(
+            url,
+            params={"access_token": INSTAGRAM_ACCESS_TOKEN},
+            json={"recipient": {"id": recipient_id}, "message": {"text": body[:1000]}},
+            timeout=15,
+        )
+        return r.status_code < 300
+    except Exception as e:
+        logger.warning("Instagram send: %s", e)
+        return False
+
+
+def _send_snapchat_gateway(recipient_id: str, body: str) -> bool:
+    if not SNAPCHAT_ENABLED or not SNAPCHAT_DM_GATEWAY_URL or not SNAPCHAT_DM_GATEWAY_TOKEN:
+        return False
+    try:
+        r = requests.post(
+            SNAPCHAT_DM_GATEWAY_URL,
+            headers={"Authorization": f"Bearer {SNAPCHAT_DM_GATEWAY_TOKEN}"},
+            json={"recipient_id": recipient_id, "text": body[:1000], "brand": BRAND_NAME},
+            timeout=15,
+        )
+        return r.status_code < 300
+    except Exception as e:
+        logger.warning("Snapchat gateway send: %s", e)
+        return False
+
+
+@app.route("/webhook/telegram", methods=["POST"])
+def telegram_webhook_public():
+    return telegram_webhook()
+
+
+@app.route("/webhook/whatsapp", methods=["GET", "POST"])
+def whatsapp_webhook_public():
+    return whatsapp_webhook()
+
+
+@app.route("/webhook/instagram", methods=["GET", "POST"])
+def instagram_webhook():
+    if request.method == "GET":
+        mode = request.args.get("hub.mode", "")
+        token = request.args.get("hub.verify_token", "")
+        challenge = request.args.get("hub.challenge", "")
+        if mode == "subscribe" and INSTAGRAM_VERIFY_TOKEN and hmac.compare_digest(token, INSTAGRAM_VERIFY_TOKEN):
+            return challenge, 200
+        return "Forbidden", 403
+    try:
+        body = request.get_json(silent=True) or {}
+        for entry in body.get("entry", []):
+            for ev in entry.get("messaging", []) or []:
+                sender = str((ev.get("sender") or {}).get("id") or "")
+                msg = ev.get("message") or {}
+                text_msg = str(msg.get("text") or "").strip()
+                if not sender or not text_msg:
+                    continue
+                uid = f"ig:{sender}"
+                db.ensure_user(uid, full_name=config.DEFAULT_STUDENT_NAMES["instagram"], platform="instagram")
+                db.set_channel_identity(uid, "instagram_user_id", sender)
+                if db.is_banned(uid):
+                    _send_instagram_text(sender, format_ban_active_message(db.get_ban_remaining_seconds(uid)))
+                    continue
+                if contains_abuse(text_msg):
+                    count, just_banned = db.record_abuse_warning(uid)
+                    _send_instagram_text(sender, format_abuse_warning_message(count, just_banned))
+                    continue
+                is_pro = db.is_pro(uid)
+                tool = detect_tool_from_text(text_msg)
+                if tool in PRO_ONLY_TOOLS and not is_pro:
+                    _send_instagram_text(sender, f"🔒 {tool} Pro feature hai. ₹{config.PRO_PRICE_INR}/30 days.")
+                    continue
+                if not is_pro:
+                    can, quota = db.try_consume_quota(uid)
+                    if not can:
+                        _send_instagram_text(sender, f"Free limit khatam. Aaj ke baad phir aana ya PRO lo. Left: {quota.get('daily_left',0)}")
+                        continue
+                u = db.get_user(uid) or {}
+                answer = get_ai_answer_v7(text_msg, tool, is_pro, language=db.get_language(uid),
+                                          phone_number=u.get("phone_number", ""), exam_type=u.get("exam_type", ""), subject=u.get("subject", ""))
+                db.add_personal_history(uid, text_msg, tool=tool, exam_type=u.get("exam_type", ""), subject=u.get("subject", ""))
+                xp, level = db.add_xp(uid, config.XP_QUESTION * (config.PRO_XP_MULTIPLIER if is_pro else 1))
+                _send_instagram_text(sender, f"{answer}\n\n⭐ +{config.XP_QUESTION * (config.PRO_XP_MULTIPLIER if is_pro else 1)} XP | Level {level}")
+        return jsonify({"ok": True})
+    except Exception as e:
+        logger.exception("Instagram webhook: %s", e)
+        return jsonify({"ok": False}), 500
+
+
+@app.route("/webhook/snapchat", methods=["POST"])
+def snapchat_webhook():
+    # Snapchat's public developer surface supports Login Kit / Creative Kit; this
+    # endpoint deliberately requires your own approved DM gateway rather than
+    # pretending there is a general public Snapchat DM bot API.
+    if not SNAPCHAT_ENABLED:
+        return jsonify({"ok": False, "error": "Snapchat DM adapter is disabled. Configure an approved gateway in SNAPCHAT_DM_GATEWAY_URL."}), 501
+    try:
+        body = request.get_json(silent=True) or {}
+        sender = str(body.get("sender_id") or body.get("user_id") or "")
+        text_msg = str(body.get("text") or "").strip()
+        if not sender or not text_msg:
+            return jsonify({"ok": True})
+        uid = f"snap:{sender}"
+        db.ensure_user(uid, full_name=config.DEFAULT_STUDENT_NAMES["snapchat"], platform="snapchat")
+        answer = get_ai_answer_v7(text_msg, detect_tool_from_text(text_msg), db.is_pro(uid))
+        _send_snapchat_gateway(sender, answer or SOFT_FAIL_MSG)
+        return jsonify({"ok": True})
+    except Exception as e:
+        logger.exception("Snapchat webhook: %s", e)
+        return jsonify({"ok": False}), 500
+
+
+# Vercel/hosted cron auth: supports either the existing dev secret, an explicit X-Cron-Secret,
+# or Authorization: Bearer CRON_SECRET for managed cron providers.
+CRON_SECRET = os.getenv("CRON_SECRET", "").strip()
+def _cron_authorized_v7() -> bool:
+    supplied = request.args.get("code") or request.headers.get("X-Cron-Secret", "")
+    if supplied and config.DEV_SECRET and hmac.compare_digest(supplied, config.DEV_SECRET):
+        return True
+    auth = request.headers.get("Authorization", "")
+    if CRON_SECRET and auth == f"Bearer {CRON_SECRET}":
+        return True
+    if request.headers.get("X-Vercel-Cron") == "1" and CRON_SECRET:
+        return True
+    return False
+_cron_authorized = _cron_authorized_v7
+
+# ---------------------------------------------------------------------------
+# Daily missions, spaced reminders, 5pm/8pm nudges, Sunday parent report,
+# 2:30am Top-5 refresh and one-command SEO warming.
+# ---------------------------------------------------------------------------
+def _cron_users() -> list[str]:
+    if not db.redis:
+        return []
+    try:
+        return list(db.redis.smembers("stats:users") or [])
+    except Exception:
+        return []
+
+
+def _send_user_push(u: dict, body: str) -> bool:
+    platform = str(u.get("platform", "")).lower()
+    if platform == "whatsapp" and u.get("phone_number"):
+        _send_whatsapp_text(u["phone_number"], body)
+        return True
+    chat = str(u.get("telegram_chat_id", "") or "")
+    if chat:
+        return _send_telegram_text(chat, body)
+    if u.get("instagram_user_id"):
+        _send_instagram_text(str(u["instagram_user_id"]), body)
+        return True
+    return False
+
+
+def _daily_nudge(text: str) -> int:
+    sent = 0
+    for uid in _cron_users():
+        u = db.get_user(uid) or {}
+        phone = normalize_phone(u.get("phone_number", ""))
+        # Telegram users without a phone can still receive nudges via chat id.
+        if not phone and not u.get("telegram_chat_id") and not u.get("instagram_user_id"):
+            continue
+        if _send_user_push(u, text):
+            sent += 1
+    return sent
+
+
+@app.route("/api/cron/daily-5pm", methods=["GET", "POST"])
+def cron_daily_5pm():
+    if not _cron_authorized():
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
+    return jsonify({"ok": True, "sent": _daily_nudge("🔥 mission ready hai")})
+
+
+@app.route("/api/cron/daily-8pm", methods=["GET", "POST"])
+def cron_daily_8pm():
+    if not _cron_authorized():
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
+    return jsonify({"ok": True, "sent": _daily_nudge("🔥 aag bujhne wali hai bacha le")})
+
+
+@app.route("/api/cron/daily-mission", methods=["GET", "POST"])
+def cron_daily_mission():
+    if not _cron_authorized():
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
+    sent = 0
+    for uid in _cron_users():
+        u = db.get_user(uid) or {}
+        mission = daily_mission_for_user(uid)
+        body = (
+            f"🔥 {mission['title']}\n\n"
+            f"1) {mission['pyq']}\n"
+            f"2) {mission['formula']}\n\n"
+            f"⏱️ {mission['duration_min']} minute. Bas itna aaj ke liye."
+        )
+        if _send_user_push(u, body):
+            sent += 1
+    return jsonify({"ok": True, "sent": sent})
+
+
+@app.route("/api/cron/reminders", methods=["GET", "POST"])
+def cron_reminders():
+    if not _cron_authorized() or not supa.enabled:
+        return jsonify({"ok": False, "error": "unauthorized_or_supabase_disabled"}), 403
+    now_iso = _now_ist().isoformat()
+    rows = supa.select_many("study_reminders", {"status": "eq.pending", "due_at": f"lte.{now_iso}"}, limit=200, columns="*")
+    sent = 0
+    for row in rows:
+        phone = normalize_phone(row.get("phone_number", ""))
+        user = supa.select_one("users", {"phone_number": f"eq.{phone}"}) or {}
+        body = (
+            f"🧠 Yaad hai? {int(row.get('offset_days') or 1)} din pehle tune yeh padha tha:\n\n"
+            f"{str(row.get('question') or '')[:500]}\n\n"
+            "Aaj 2 minute de aur khud se answer bol. Phir Fire kar. 🔥"
+        )
+        ok = False
+        if user:
+            ok = _send_user_push(user, body)
+        if ok:
+            supa.update("study_reminders", {"id": f"eq.{row.get('id')}"}, {"status": "sent", "sent_at": _now_ist().isoformat()})
+            sent += 1
+    return jsonify({"ok": True, "due": len(rows), "sent": sent})
+
+
+@app.route("/api/cron/video-update", methods=["GET", "POST"])
+def cron_video_update():
+    if not _cron_authorized():
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
+    # 2:30AM IST cron: refresh the current Top-5 video cache for the most active topics.
+    topics = set()
+    for uid in _cron_users()[:5000]:
+        u = db.get_user(uid) or {}
+        q = str(u.get("subject") or u.get("exam_type") or "study")
+        if q:
+            topics.add(q)
+    saved = 0
+    for topic in list(topics)[:100]:
+        links = _youtube_links(topic, 5)
+        if db.redis:
+            try:
+                db.redis.setex(f"top5video:{topic.lower()}", 86400 * 2, json.dumps(links))
+                saved += 1
+            except Exception:
+                pass
+    return jsonify({"ok": True, "topics_refreshed": saved})
+
+
+@app.route("/api/cron/seo-warmup", methods=["GET", "POST"])
+def cron_seo_warmup():
+    if not _cron_authorized():
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
+    return jsonify({"ok": True, "message": "SEO pages are generated by the Next.js catalog + sitemap; this route is a cache-warm hook."})
+
+
+# ---------------------------------------------------------------------------
+# Library + community verification endpoints.
+# ---------------------------------------------------------------------------
+@app.route("/api/library/vote", methods=["POST"])
+def api_library_vote():
+    data = request.get_json(silent=True) or {}
+    uid = str(data.get("uid") or data.get("client_id") or "").strip()
+    library_id = int(data.get("library_id") or 0)
+    vote = int(data.get("vote") or 1)
+    if uid.startswith("web:"):
+        db.ensure_user(uid, platform="web", full_name=config.DEFAULT_STUDENT_NAMES["web"], phone_number=data.get("phone_number", ""))
+    if not library_id:
+        return jsonify({"ok": False, "error": "library_id required"}), 400
+    ok = _library_vote(uid, library_id, vote)
+    return jsonify({"ok": ok, "verification": _verify_library_item(library_id)})
+
+
+@app.route("/api/daily-mission/complete", methods=["POST"])
+def api_daily_mission_complete():
+    data = request.get_json(silent=True) or {}
+    uid = str(data.get("uid") or data.get("client_id") or "").strip()
+    if not uid:
+        return jsonify({"ok": False, "error": "uid/client_id required"}), 400
+    if uid.startswith("web:"):
+        db.ensure_user(uid, full_name=config.DEFAULT_STUDENT_NAMES["web"], platform="web", phone_number=data.get("phone_number", ""))
+    key = f"mission:done:{_canonical_uid(db, uid)}:{_today_ist()}"
+    if db.redis and not db.redis.set(key, "1", nx=True, ex=90000):
+        return jsonify({"ok": True, "already_done": True, "reward_coins": 0, "coins": db.get_coins(uid)})
+    reward = config.MISSION_REWARD_COINS
+    coins = db.add_coins(uid, reward)
+    db.add_xp(uid, config.DAILY_MISSION_XP)
+    return jsonify({"ok": True, "already_done": False, "reward_coins": reward, "reward_xp": config.DAILY_MISSION_XP, "coins": coins})
+
+
+@app.route("/api/daily-mission")
+def api_daily_mission():
+    uid = str(request.args.get("uid") or request.args.get("client_id") or "").strip()
+    if not uid:
+        return jsonify({"ok": False, "error": "uid/client_id required"}), 400
+    if uid.startswith("web:"):
+        db.ensure_user(uid, full_name=config.DEFAULT_STUDENT_NAMES["web"], platform="web")
+    return jsonify({"ok": True, "mission": daily_mission_for_user(uid)})
+
+
+@app.route("/api/features")
+def api_features():
+    return jsonify({"brand": BRAND_NAME, "features": FEATURE_CATALOG_28, "free": {
+        "questions_per_day": config.FREE_DAILY, "pdf_per_day": config.FREE_PDF_PER_DAY,
+        "video_links_per_day": config.FREE_VIDEO_LINKS, "assignment_per_day": config.FREE_ASSIGNMENT_PER_DAY
+    }, "pro": {
+        "price_inr": config.PRO_PRICE_INR, "questions": "unlimited",
+        "video_links": config.PRO_VIDEO_LINKS, "assignment": "unlimited",
+        "viva_questions": config.PRO_VIVA_QUESTIONS
+    }})
+
+
+@app.route("/api/export/pdf")
+def api_export_pdf():
+    """Small student-owned answer sheet export. It does not reproduce copyrighted books."""
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.pdfgen import canvas
+    except Exception:
+        return jsonify({"ok": False, "error": "reportlab not installed"}), 503
+    question = request.args.get("question", "SaarthiBhai study sheet")[:1000]
+    uid = request.args.get("uid", "")[:200]
+    # If a uid is available, enforce one free PDF/day outside Pro.
+    if uid and uid in ("",):
+        uid = uid
+    if uid and not uid.startswith("phone:"):
+        try:
+            is_pro = db.is_pro(uid)
+        except Exception:
+            is_pro = False
+    else:
+        is_pro = False
+    if uid and not is_pro and db.redis:
+        if not db.redis.set(f"resource:pdf:{_canonical_uid(db, uid)}:{_today_ist()}", "1", nx=True, ex=90000):
+            return jsonify({"ok": False, "error": "Aaj ka free PDF already use ho gaya. PRO me unlimited."}), 429
+    from io import BytesIO
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    c.setTitle(BRAND_NAME)
+    y = 800
+    c.setFont("Helvetica-Bold", 16); c.drawString(40, y, BRAND_NAME); y -= 30
+    c.setFont("Helvetica", 11)
+    c.drawString(40, y, "Study Sheet"); y -= 25
+    for line in question.splitlines()[:35]:
+        if y < 50:
+            c.showPage(); y = 800; c.setFont("Helvetica", 11)
+        c.drawString(40, y, line[:120]); y -= 16
+    c.showPage(); c.save(); buf.seek(0)
+    from flask import send_file
+    return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name="saarthibhai-study-sheet.pdf")
+
+
+# ---------------------------------------------------------------------------
+# PWA assets from Flask too, so the legacy web app remains installable.
+# The separate Next.js app has the same manifest/service worker.
+# ---------------------------------------------------------------------------
+@app.route("/manifest.webmanifest")
+def legacy_manifest():
+    return jsonify({
+        "name": BRAND_NAME, "short_name": config.SHORT_NAME, "start_url": "/", "scope": "/",
+        "display": "standalone", "background_color": config.THEME["primary"], "theme_color": config.THEME["primary"],
+        "icons": [{"src": "/bot-icon.svg", "sizes": "any", "type": "image/svg+xml"}],
+        "description": config.PWA_DESCRIPTION,
+    })
+
+
+@app.route("/sw.js")
+def legacy_sw():
+    js = ("\nconst CACHE=" + json.dumps(SW_CACHE_NAME) + ";\n"
+          "self.addEventListener('install',e=>e.waitUntil(caches.open(CACHE).then(c=>c.addAll(['/']))));\n"
+          "self.addEventListener('activate',e=>e.waitUntil(self.clients.claim()));\n"
+          "self.addEventListener('fetch',e=>{if(e.request.method==='GET'){e.respondWith(caches.match(e.request).then(r=>r||fetch(e.request).catch(()=>caches.match('/'))));}});\n")
+    from flask import Response
+    return Response(js, mimetype="application/javascript")
+
+
+# ---------------------------------------------------------------------------
+# Brand + creator endpoints used by the Next.js frontend.
+# ---------------------------------------------------------------------------
+@app.route("/api/branding")
+def api_branding():
+    return jsonify({"name": BRAND_NAME, "creator": config.CREATOR_NAME, "photo": CREATOR_PHOTO_URL, "story": CREATOR_STORY_URL})
+
+
+# ---------------------------------------------------------------------------
+# Add Telegram identity capture without rewriting the long-lived handler.
+# The normal question path already calls ensure_user; this hook only records chat id.
+# ---------------------------------------------------------------------------
+_orig_process_question = process_question
+async def process_question_v7(update, context, text, tool="general"):
+    try:
+        if update and update.effective_user:
+            uid = update.effective_user.id
+            chat_id = update.effective_chat.id if update.effective_chat else uid
+            db.ensure_user(uid, full_name=getattr(update.effective_user, "full_name", config.DEFAULT_STUDENT_NAMES["generic"]) or config.DEFAULT_STUDENT_NAMES["generic"], platform="telegram")
+            db.set_channel_identity(uid, "telegram_chat_id", str(chat_id))
+    except Exception as e:
+        logger.debug("telegram v7 metadata: %s", e)
+    return await _orig_process_question(update, context, text, tool)
+process_question = process_question_v7
+
+# Reminder scheduling for web is added through the common API path by a small hook.
+_orig_v7_ai = get_ai_answer
+
+
+@app.route("/api/resource/assignment", methods=["GET", "POST"])
+def api_resource_assignment():
+    data = request.get_json(silent=True) or {}
+    if request.method == "GET":
+        uid = str(request.args.get("uid") or request.args.get("client_id") or "").strip()
+        q = str(request.args.get("question") or request.args.get("topic") or "").strip()
+        data = {"uid": uid, "client_id": request.args.get("client_id", ""), "question": q, "topic": q}
+    uid = str(data.get("uid") or data.get("client_id") or "").strip()
+    q = str(data.get("question") or data.get("topic") or "").strip()
+    if not uid or not q:
+        return jsonify({"ok": False, "error": "uid/client_id and topic required"}), 400
+    if uid.startswith("web:"):
+        db.ensure_user(uid, full_name=config.DEFAULT_STUDENT_NAMES["web"], platform="web", phone_number=data.get("phone_number", ""))
+    pro = db.is_pro(uid)
+    if not pro and db.redis:
+        key=f"resource:assignment:{_canonical_uid(db,uid)}:{_today_ist()}"
+        if not db.redis.set(key,"1",nx=True,ex=90000):
+            return jsonify({"ok":False,"error":"Aaj ka free assignment use ho gaya. PRO me unlimited."}),429
+    ans = get_ai_answer_v7(
+        f"Create one complete student-ready assignment on this topic: {q}. Include objective, 5-10 tasks/questions, answer/solution guide, and submission checklist. No fabricated source citations.",
+        "notes", pro, language=db.get_language(uid), phone_number=_phone_for_uid(uid)
+    )
+    return jsonify({"ok":True,"assignment":ans,"pro":pro})
+
+
+@app.route("/api/resource/placement", methods=["POST"])
+def api_resource_placement():
+    data = request.get_json(silent=True) or {}
+    uid = str(data.get("uid") or data.get("client_id") or "").strip()
+    role = str(data.get("role") or data.get("topic") or "software placement").strip()
+    if not uid:
+        return jsonify({"ok":False,"error":"uid/client_id required"}),400
+    if uid.startswith("web:"):
+        db.ensure_user(uid, full_name=config.DEFAULT_STUDENT_NAMES["web"], platform="web", phone_number=data.get("phone_number", ""))
+    if not db.is_pro(uid):
+        return jsonify({"ok":False,"error":"Placement pack is PRO-only"}),403
+    prompt=(f"Build a placement-prep pack for the role {role}: 10 interview questions, 5 coding questions with solutions, a 7-day prep checklist, common mistakes, and one clean starter project idea.")
+    ans=run_ai(ai.answer,prompt,"career",is_pro=True,language=db.get_language(uid))
+    return jsonify({"ok":True,"placement":ans})
+
+
+@app.route("/api/resource/viva", methods=["POST"])
+def api_resource_viva():
+    data = request.get_json(silent=True) or {}
+    uid = str(data.get("uid") or data.get("client_id") or "").strip()
+    q = str(data.get("question") or data.get("topic") or "").strip()
+    if not uid or not q:
+        return jsonify({"ok":False,"error":"uid/client_id and topic required"}),400
+    if uid.startswith("web:"):
+        db.ensure_user(uid, full_name=config.DEFAULT_STUDENT_NAMES["web"], platform="web", phone_number=data.get("phone_number", ""))
+    if not db.is_pro(uid):
+        return jsonify({"ok":False,"error":"Viva pack is PRO-only"}),403
+    ans = run_ai(ai.answer, config.PRODUCT_TEXT["viva_prompt"].format(count=config.PRO_VIVA_QUESTIONS, topic=q), "mcq", is_pro=True, language=db.get_language(uid))
+    return jsonify({"ok":True,"viva":ans})
+
+
+@app.route("/api/cron/backup", methods=["GET", "POST"])
+def cron_backup():
+    if not _cron_authorized() or not supa.enabled:
+        return jsonify({"ok": False, "error": "unauthorized_or_supabase_disabled"}), 403
+    snapshot = {"created_at": _now_ist().isoformat(), "brand": BRAND_NAME, "stats": db.get_stats(), "users": []}
+    for uid in _cron_users()[:20000]:
+        u = db.get_user(uid) or {}
+        snapshot["users"].append({
+            "phone_number": u.get("phone_number", ""), "full_name": u.get("full_name", config.DEFAULT_STUDENT_NAMES["generic"]),
+            "coins": int(u.get("coins",0) or 0), "xp": int(u.get("xp",0) or 0),
+            "streak": int(u.get("streak",0) or 0), "level": int(u.get("level",1) or 1),
+            "exam_type": u.get("exam_type","general"), "subject": u.get("subject","general"),
+        })
+    ok = supa.insert("backups", {"kind":"daily_profile_snapshot", "payload":snapshot})
+    return jsonify({"ok": ok, "users": len(snapshot["users"])})
+
+
 if __name__ == "__main__":
     # threaded=True lets Flask's dev server handle multiple concurrent
     # requests (AI calls already run off-thread via the pool, so the web
     # worker itself must not block on them). For real production traffic,
     # run behind gunicorn with multiple workers instead of this dev server:
     #   gunicorn -w 4 -k gthread --threads 8 -b 0.0.0.0:$PORT studygenie_bot:app
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), threaded=True)
+    app.run(host="0.0.0.0", port=config.PORT, threaded=True)
