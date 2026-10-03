@@ -104,7 +104,21 @@
   "channels": {
     "whatsapp_api_version": "v20.0",
     "instagram_graph_version": "v23.0",
-    "snapchat_gateway_enabled": false
+    "snapchat_gateway_enabled": false,
+    "discord": {
+      "enabled": false,
+      "message_content_intent": true,
+      "max_response_chars": 1900,
+      "command_name": "ask",
+      "command_description": "SaarthiBhai se padhai ka sawaal poochho"
+    },
+    "reddit": {
+      "enabled": false,
+      "backend_path": "/webhook/reddit",
+      "trigger_prefix": "saarthibhai",
+      "auto_reply": true,
+      "max_reply_chars": 900
+    }
   },
   "urls": {
     "razorpay_orders": "https://api.razorpay.com/v1/orders",
