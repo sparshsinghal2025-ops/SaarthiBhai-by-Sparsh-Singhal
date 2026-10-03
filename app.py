@@ -237,6 +237,24 @@ class Config:
         self.SNAPCHAT_ENABLED = snap.lower() in ("1", "true", "yes") if snap else bool(_setting("channels.snapchat_gateway_enabled"))
         self.SNAPCHAT_DM_GATEWAY_URL = _env("SNAPCHAT_DM_GATEWAY_URL")
         self.SNAPCHAT_DM_GATEWAY_TOKEN = _env("SNAPCHAT_DM_GATEWAY_TOKEN")
+
+        # Discord / Reddit channel integrations. These are optional worker/app
+        # surfaces; they reuse the same database, quota, AI and safety pipeline.
+        self.DISCORD_ENABLED = (_env("DISCORD_ENABLED").lower() in ("1", "true", "yes")) if _env("DISCORD_ENABLED") else bool(_setting("channels.discord.enabled"))
+        self.DISCORD_BOT_TOKEN = _env("DISCORD_BOT_TOKEN")
+        self.DISCORD_GUILD_ID = _env("DISCORD_GUILD_ID")
+        self.DISCORD_MESSAGE_CONTENT_INTENT = (_env("DISCORD_MESSAGE_CONTENT_INTENT").lower() in ("1", "true", "yes")) if _env("DISCORD_MESSAGE_CONTENT_INTENT") else bool(_setting("channels.discord.message_content_intent"))
+        self.DISCORD_MAX_RESPONSE_CHARS = int(_env_or_setting("DISCORD_MAX_RESPONSE_CHARS", "channels.discord.max_response_chars"))
+        self.DISCORD_COMMAND_NAME = str(_env_or_setting("DISCORD_COMMAND_NAME", "channels.discord.command_name"))
+        self.DISCORD_COMMAND_DESCRIPTION = str(_env_or_setting("DISCORD_COMMAND_DESCRIPTION", "channels.discord.command_description"))
+
+        self.REDDIT_ENABLED = (_env("REDDIT_ENABLED").lower() in ("1", "true", "yes")) if _env("REDDIT_ENABLED") else bool(_setting("channels.reddit.enabled"))
+        self.REDDIT_BACKEND_TOKEN = _env("REDDIT_BACKEND_TOKEN")
+        self.REDDIT_BACKEND_PATH = str(_env_or_setting("REDDIT_BACKEND_PATH", "channels.reddit.backend_path"))
+        self.REDDIT_TRIGGER_PREFIX = str(_env_or_setting("REDDIT_TRIGGER_PREFIX", "channels.reddit.trigger_prefix"))
+        self.REDDIT_AUTO_REPLY = (_env("REDDIT_AUTO_REPLY").lower() in ("1", "true", "yes")) if _env("REDDIT_AUTO_REPLY") else bool(_setting("channels.reddit.auto_reply"))
+        self.REDDIT_MAX_REPLY_CHARS = int(_env_or_setting("REDDIT_MAX_REPLY_CHARS", "channels.reddit.max_reply_chars"))
+
         self.REDIS_MAX_CONN = int(_env_or_setting("REDIS_MAX_CONN", "runtime.redis_max_connections"))
         self.AI_POOL_WORKERS = int(_env_or_setting("AI_POOL_WORKERS", "runtime.ai_pool_workers"))
         self.AI_TIMEOUT_SEC = float(_env_or_setting("AI_TIMEOUT_SEC", "runtime.ai_timeout_sec"))
@@ -5516,6 +5534,8 @@ def _feature_status() -> Dict[str, Any]:
             "exam_bomb_cron_route": True,
         },
         "ready": {
+            "discord_worker": bool(config.DISCORD_ENABLED and config.DISCORD_BOT_TOKEN),
+            "reddit_devvit_bridge": bool(config.REDDIT_ENABLED and config.REDDIT_BACKEND_TOKEN),
             "razorpay_payments": bool(config.RAZORPAY_KEY_ID and config.RAZORPAY_KEY_SECRET),
             "razorpay_webhook_verified": bool(config.RAZORPAY_WEBHOOK_SECRET),
             "whatsapp_surface": bool(config.WHATSAPP_TOKEN and config.WHATSAPP_PHONE_NUMBER_ID),
@@ -7536,6 +7556,113 @@ def api_resource_viva():
         return jsonify({"ok":False,"error":"Viva pack is PRO-only"}),403
     ans = run_ai(ai.answer, config.PRODUCT_TEXT["viva_prompt"].format(count=config.PRO_VIVA_QUESTIONS, topic=q), "mcq", is_pro=True, language=db.get_language(uid))
     return jsonify({"ok":True,"viva":ans})
+
+
+
+# ---------------------------------------------------------------------------
+# REDDIT / DEVVIT BRIDGE
+# Reddit's current supported automation path is a Devvit app trigger. The
+# Devvit worker forwards a qualifying comment here, then posts the returned
+# answer back to Reddit as the SaarthiBhai app account. This endpoint is kept
+# idempotent so trigger retries never double-charge a student or double-answer.
+# ---------------------------------------------------------------------------
+def _reddit_authorized() -> bool:
+    if not config.REDDIT_ENABLED or not config.REDDIT_BACKEND_TOKEN:
+        return False
+    auth = request.headers.get("Authorization", "")
+    return hmac.compare_digest(auth, f"Bearer {config.REDDIT_BACKEND_TOKEN}")
+
+
+@app.route("/webhook/reddit", methods=["POST"])
+def reddit_webhook_bridge():
+    if not _reddit_authorized():
+        return jsonify({"ok": False, "error": "unauthorized"}), 403
+    body = request.get_json(silent=True) or {}
+    event_id = str(body.get("event_id") or body.get("comment_id") or secrets.token_hex(12)).strip()
+    text_msg = str(body.get("text") or body.get("comment_body") or "").strip()
+    author_id = str(body.get("author_id") or body.get("author_name") or "anonymous").strip()
+    author_name = str(body.get("author_name") or "Reddit Student").strip()
+    subreddit = str(body.get("subreddit") or "").strip()
+    comment_id = str(body.get("comment_id") or "").strip()
+
+    if not text_msg:
+        return jsonify({"ok": True, "ignored": True, "reason": "empty"})
+    if not config.REDDIT_AUTO_REPLY:
+        return jsonify({"ok": True, "ignored": True, "reason": "auto_reply_disabled"})
+    if config.REDDIT_TRIGGER_PREFIX and config.REDDIT_TRIGGER_PREFIX.lower() not in text_msg.lower():
+        return jsonify({"ok": True, "ignored": True, "reason": "trigger_not_found"})
+
+    if db.redis:
+        try:
+            if not db.redis.set(f"reddit:event:{event_id}", "1", nx=True, ex=86400 * 7):
+                return jsonify({"ok": True, "duplicate": True})
+        except Exception:
+            pass
+
+    uid = f"reddit:{author_id}"
+    db.ensure_user(uid, full_name=author_name or config.DEFAULT_STUDENT_NAMES["generic"], platform="reddit")
+    db.set_channel_identity(uid, "reddit_user_id", author_id)
+    if subreddit:
+        db.set_channel_identity(uid, "reddit_subreddit", subreddit)
+
+    if db.is_banned(uid):
+        return jsonify({"ok": True, "reply": format_ban_active_message(db.get_ban_remaining_seconds(uid))})
+    if contains_abuse(text_msg):
+        count, just_banned = db.record_abuse_warning(uid)
+        return jsonify({"ok": True, "reply": format_abuse_warning_message(count, just_banned), "moderation": True})
+
+    # Strip the trigger word while keeping the actual student question.
+    cleaned = text_msg.strip()
+    if config.REDDIT_TRIGGER_PREFIX:
+        cleaned = re.sub(re.escape(config.REDDIT_TRIGGER_PREFIX), "", cleaned, count=1, flags=re.IGNORECASE).strip(" :,-")
+    if not cleaned:
+        cleaned = "Bhai mujhe padhai me help chahiye — aaj kya padhna chahiye?"
+
+    is_pro = db.is_pro(uid)
+    tool = detect_tool_from_text(cleaned)
+    if tool in config.PRO_ONLY_TOOLS and not is_pro:
+        return jsonify({"ok": True, "reply": config.PRODUCT_TEXT["pro_tool"] + f" Upgrade ₹{config.PRO_PRICE_INR}/30 days."})
+    if not is_pro:
+        can, quota = db.try_consume_quota(uid)
+        if not can:
+            return jsonify({"ok": True, "reply": config.PRODUCT_TEXT["free_limit"] + " — kal phir aa jana."})
+
+    user = db.get_user(uid) or {}
+    answer = get_ai_answer_v7(
+        cleaned,
+        tool,
+        is_pro,
+        language=db.get_language(uid),
+        phone_number=user.get("phone_number", ""),
+        exam_type=user.get("exam_type", ""),
+        subject=user.get("subject", ""),
+    ) or config.SYSTEM_PROTOCOL["public_error_no_response"]
+
+    db.track_activity(uid)
+    try:
+        ex, sub = guess_exam_subject(cleaned, user.get("exam_type", ""), user.get("subject", ""))
+        user["exam_type"], user["subject"] = ex, sub
+        user["last_question_at"] = _now_ist().isoformat()
+        db.save_user(uid, user)
+        db.sync_user_to_supabase(uid, user)
+        db.add_personal_history(uid, cleaned, tool=tool, exam_type=ex, subject=sub, source_cache="reddit")
+        schedule_spaced_reminders(uid, cleaned, tool)
+        xp, level = db.add_xp(uid, config.XP_QUESTION * (config.PRO_XP_MULTIPLIER if is_pro else 1))
+        if db.redis:
+            db.redis.hincrby(db._key(uid), "questions_asked", 1)
+            db.redis.incr("stats:total_questions")
+    except Exception as exc:
+        logger.warning("Reddit profile sync failed: %s", exc)
+        xp, level = 0, int(user.get("level", 1) or 1)
+
+    return jsonify({
+        "ok": True,
+        "reply": answer[:config.REDDIT_MAX_REPLY_CHARS],
+        "comment_id": comment_id,
+        "subreddit": subreddit,
+        "xp": xp,
+        "level": level,
+    })
 
 
 @app.route("/api/cron/backup", methods=["GET", "POST"])
