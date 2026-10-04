@@ -5522,6 +5522,12 @@ def health():
         "build_line_count": BUILD_LINE_COUNT,
         "creator": config.CREATOR_NAME,
         "features": _feature_status(),
+        "discord_diagnostics": {
+            "application_id_present": bool(config.DISCORD_APPLICATION_ID),
+            "guild_id_present": bool(config.DISCORD_GUILD_ID),
+            "run_mode": config.DISCORD_RUN_MODE,
+            **_discord_public_key_diagnostics(),
+        },
     })
 
 
@@ -7719,20 +7725,57 @@ except Exception:  # dependency is installed via requirements.txt in this build
     VerifyKey = None
 
 
+def _discord_public_key_diagnostics() -> dict:
+    key = (config.DISCORD_PUBLIC_KEY or "").strip()
+    hex_ok = False
+    parse_ok = False
+    try:
+        hex_ok = len(key) == 64 and all(c in "0123456789abcdefABCDEF" for c in key)
+        if hex_ok and VerifyKey is not None:
+            VerifyKey(bytes.fromhex(key))
+            parse_ok = True
+    except Exception:
+        parse_ok = False
+    preview = ""
+    if key:
+        preview = key[:8] + "..." + key[-8:] if len(key) >= 16 else key
+    return {
+        "configured": bool(key),
+        "length": len(key),
+        "hex_64": hex_ok,
+        "verifykey_parseable": parse_ok,
+        "preview": preview,
+        "verifier_library_loaded": VerifyKey is not None,
+    }
+
+
 def _discord_http_verify(raw_body: bytes) -> bool:
-    if not config.DISCORD_PUBLIC_KEY or VerifyKey is None:
-        return False
+    diag = _discord_public_key_diagnostics()
     signature = request.headers.get("X-Signature-Ed25519", "")
     timestamp = request.headers.get("X-Signature-Timestamp", "")
+    if not diag["configured"] or not diag["verifykey_parseable"]:
+        logger.error(
+            "Discord signature verify unavailable: key_configured=%s length=%s hex64=%s parseable=%s verifier=%s",
+            diag["configured"], diag["length"], diag["hex_64"], diag["verifykey_parseable"], diag["verifier_library_loaded"]
+        )
+        return False
     if len(signature) != 128 or not timestamp:
+        logger.error(
+            "Discord signature verify rejected headers: signature_len=%s timestamp_present=%s",
+            len(signature), bool(timestamp)
+        )
         return False
     try:
-        VerifyKey(bytes.fromhex(config.DISCORD_PUBLIC_KEY)).verify(
+        VerifyKey(bytes.fromhex((config.DISCORD_PUBLIC_KEY or "").strip())).verify(
             timestamp.encode("utf-8") + raw_body,
             bytes.fromhex(signature),
         )
         return True
     except (ValueError, BadSignatureError):
+        logger.error(
+            "Discord signature mismatch: key_preview=%s signature_len=%s timestamp_present=%s raw_len=%s",
+            diag["preview"], len(signature), bool(timestamp), len(raw_body)
+        )
         return False
 
 
