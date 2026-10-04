@@ -1,8 +1,10 @@
 flask
-gunicorn
-python-telegram-bot
 redis
 requests
 python-dotenv
 google-genai
 groq
+python-telegram-bot
+reportlab
+discord.py
+PyNaCl
