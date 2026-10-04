@@ -24,7 +24,7 @@ import time
 from urllib.parse import quote, urlencode
 from collections import defaultdict
 from datetime import datetime, timedelta
-from threading import Lock
+from threading import Lock, Thread
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -242,11 +242,14 @@ class Config:
         # surfaces; they reuse the same database, quota, AI and safety pipeline.
         self.DISCORD_ENABLED = (_env("DISCORD_ENABLED").lower() in ("1", "true", "yes")) if _env("DISCORD_ENABLED") else bool(_setting("channels.discord.enabled"))
         self.DISCORD_BOT_TOKEN = _env("DISCORD_BOT_TOKEN")
+        self.DISCORD_APPLICATION_ID = _env("DISCORD_APPLICATION_ID")
+        self.DISCORD_PUBLIC_KEY = _env("DISCORD_PUBLIC_KEY")
         self.DISCORD_GUILD_ID = _env("DISCORD_GUILD_ID")
         self.DISCORD_MESSAGE_CONTENT_INTENT = (_env("DISCORD_MESSAGE_CONTENT_INTENT").lower() in ("1", "true", "yes")) if _env("DISCORD_MESSAGE_CONTENT_INTENT") else bool(_setting("channels.discord.message_content_intent"))
         self.DISCORD_MAX_RESPONSE_CHARS = int(_env_or_setting("DISCORD_MAX_RESPONSE_CHARS", "channels.discord.max_response_chars"))
         self.DISCORD_COMMAND_NAME = str(_env_or_setting("DISCORD_COMMAND_NAME", "channels.discord.command_name"))
         self.DISCORD_COMMAND_DESCRIPTION = str(_env_or_setting("DISCORD_COMMAND_DESCRIPTION", "channels.discord.command_description"))
+        self.DISCORD_RUN_MODE = str(_env_or_setting("DISCORD_RUN_MODE", "channels.discord.run_mode")).strip().lower()
 
         self.REDDIT_ENABLED = (_env("REDDIT_ENABLED").lower() in ("1", "true", "yes")) if _env("REDDIT_ENABLED") else bool(_setting("channels.reddit.enabled"))
         self.REDDIT_BACKEND_TOKEN = _env("REDDIT_BACKEND_TOKEN")
@@ -5175,6 +5178,25 @@ loadClasses();
 
 app = Flask(__name__)
 
+
+@app.route("/webhook/discord", methods=["POST"])
+def discord_interactions_webhook():
+    """Discord HTTP interactions endpoint; no persistent Gateway is required."""
+    raw = request.get_data(cache=True)
+    if not _discord_http_verify(raw):
+        return jsonify({"ok": False, "error": "invalid_signature"}), 401
+    payload = request.get_json(silent=True) or {}
+    interaction_type = int(payload.get("type") or 0)
+    if interaction_type == 1:
+        return jsonify({"type": 1}), 200
+    if interaction_type != 2:
+        return jsonify({"type": 4, "data": {"content": "SaarthiBhai currently supports /ask."}}), 200
+    # Acknowledge within Discord's deadline, then finish the AI work in a thread.
+    Thread(target=_discord_http_process, args=(payload,), daemon=True, name="discord-http-answer").start()
+    return jsonify({"type": 5}), 200
+
+
+
 SAARTHIBHAI_CORS_ORIGIN = config.CORS_ORIGIN
 @app.after_request
 def _v7_cors(resp):
@@ -5535,6 +5557,9 @@ def _feature_status() -> Dict[str, Any]:
         },
         "ready": {
             "discord_worker": bool(config.DISCORD_ENABLED and config.DISCORD_BOT_TOKEN),
+            "discord_mode": config.DISCORD_RUN_MODE,
+            "discord_http_interactions": bool(config.DISCORD_ENABLED and config.DISCORD_APPLICATION_ID and config.DISCORD_PUBLIC_KEY and config.DISCORD_RUN_MODE == "http_interactions"),
+            "discord_embedded_web": bool(config.DISCORD_ENABLED and config.DISCORD_BOT_TOKEN and config.DISCORD_RUN_MODE == "embedded_web"),
             "reddit_devvit_bridge": bool(config.REDDIT_ENABLED and config.REDDIT_BACKEND_TOKEN),
             "razorpay_payments": bool(config.RAZORPAY_KEY_ID and config.RAZORPAY_KEY_SECRET),
             "razorpay_webhook_verified": bool(config.RAZORPAY_WEBHOOK_SECRET),
@@ -7682,10 +7707,172 @@ def cron_backup():
     return jsonify({"ok": ok, "users": len(snapshot["users"])})
 
 
+# ---------------------------------------------------------------------------
+# Discord HTTP-interactions mode (Render Free compatible)
+# ---------------------------------------------------------------------------
+
+try:
+    from nacl.exceptions import BadSignatureError
+    from nacl.signing import VerifyKey
+except Exception:  # dependency is installed via requirements.txt in this build
+    BadSignatureError = Exception
+    VerifyKey = None
+
+
+def _discord_http_verify(raw_body: bytes) -> bool:
+    if not config.DISCORD_PUBLIC_KEY or VerifyKey is None:
+        return False
+    signature = request.headers.get("X-Signature-Ed25519", "")
+    timestamp = request.headers.get("X-Signature-Timestamp", "")
+    if len(signature) != 128 or not timestamp:
+        return False
+    try:
+        VerifyKey(bytes.fromhex(config.DISCORD_PUBLIC_KEY)).verify(
+            timestamp.encode("utf-8") + raw_body,
+            bytes.fromhex(signature),
+        )
+        return True
+    except (ValueError, BadSignatureError):
+        return False
+
+
+def _discord_http_register_command() -> bool:
+    if not (config.DISCORD_ENABLED and config.DISCORD_BOT_TOKEN and config.DISCORD_APPLICATION_ID):
+        return False
+    command = {
+        "name": config.DISCORD_COMMAND_NAME,
+        "description": config.DISCORD_COMMAND_DESCRIPTION,
+        "type": 1,
+        "options": [{
+            "name": "question",
+            "description": "Padhai ka sawaal",
+            "type": 3,
+            "required": True,
+            "max_length": 1800,
+        }],
+    }
+    url = f"https://discord.com/api/v10/applications/{config.DISCORD_APPLICATION_ID}/guilds/{config.DISCORD_GUILD_ID}/commands" if config.DISCORD_GUILD_ID else f"https://discord.com/api/v10/applications/{config.DISCORD_APPLICATION_ID}/commands"
+    try:
+        r = requests.post(
+            url,
+            headers={"Authorization": f"Bot {config.DISCORD_BOT_TOKEN}", "Content-Type": "application/json"},
+            json=command,
+            timeout=15,
+        )
+        if not r.ok:
+            logger.error("Discord HTTP command registration failed: %s %s", r.status_code, r.text[:500])
+            return False
+        logger.info("Discord HTTP slash command registered: /%s", config.DISCORD_COMMAND_NAME)
+        return True
+    except Exception:
+        logger.exception("Discord HTTP command registration error")
+        return False
+
+
+def _discord_http_edit_original(interaction_token: str, content: str) -> None:
+    if not config.DISCORD_APPLICATION_ID:
+        return
+    url = f"https://discord.com/api/v10/webhooks/{config.DISCORD_APPLICATION_ID}/{interaction_token}/messages/@original"
+    try:
+        r = requests.patch(url, json={"content": content[:config.DISCORD_MAX_RESPONSE_CHARS]}, timeout=20)
+        if not r.ok:
+            logger.error("Discord HTTP follow-up failed: %s %s", r.status_code, r.text[:500])
+    except Exception:
+        logger.exception("Discord HTTP follow-up exception")
+
+
+def _discord_http_process(interaction: dict) -> None:
+    try:
+        user = interaction.get("member", {}).get("user") or interaction.get("user") or {}
+        user_id = str(user.get("id") or "")
+        display_name = str(user.get("global_name") or user.get("username") or "Discord Student")
+        options = interaction.get("data", {}).get("options") or []
+        question = ""
+        for option in options:
+            if option.get("name") == config.DISCORD_COMMAND_NAME:
+                question = str(option.get("value") or "")
+            elif option.get("type") == 3:
+                question = str(option.get("value") or "")
+        if not user_id or not question.strip():
+            _discord_http_edit_original(interaction.get("token", ""), "Bhai question bhej 😄")
+            return
+        from types import SimpleNamespace
+        from discord_bot import answer_for_user
+        answer = asyncio.run(answer_for_user(SimpleNamespace(id=int(user_id), display_name=display_name, name=display_name), question, "discord"))
+        _discord_http_edit_original(interaction.get("token", ""), answer)
+    except Exception:
+        logger.exception("Discord HTTP interaction processing failed")
+        _discord_http_edit_original(interaction.get("token", ""), config.SYSTEM_PROTOCOL["public_error_no_response"])
+
+
+def _discord_http_endpoint_ready() -> bool:
+    return bool(config.DISCORD_ENABLED and config.DISCORD_APPLICATION_ID and config.DISCORD_PUBLIC_KEY)
+
+
+# ---------------------------------------------------------------------------
+# Discord free-Render mode
+# ---------------------------------------------------------------------------
+_discord_embedded_thread = None
+_discord_embedded_started = False
+
+
+def _start_embedded_discord() -> None:
+    global _discord_embedded_thread, _discord_embedded_started
+    if _discord_embedded_started or not config.DISCORD_ENABLED:
+        return
+    if config.DISCORD_RUN_MODE == "http_interactions":
+        if _discord_http_endpoint_ready():
+            _discord_http_register_command()
+            logger.info("Discord HTTP interactions mode enabled at /webhook/discord")
+        else:
+            logger.warning("Discord HTTP interactions mode enabled but DISCORD_APPLICATION_ID/DISCORD_PUBLIC_KEY are missing")
+        return
+    if config.DISCORD_RUN_MODE != "embedded_web":
+        logging.getLogger("saarthibhai.discord.embed").info(
+            "Discord embedded web mode disabled; run_mode=%s", config.DISCORD_RUN_MODE
+        )
+        return
+    if not config.DISCORD_BOT_TOKEN:
+        logging.getLogger("saarthibhai.discord.embed").warning(
+            "DISCORD_ENABLED=true but DISCORD_BOT_TOKEN is empty; Discord not started"
+        )
+        return
+
+    try:
+        from discord_bot import start_discord_bot
+    except Exception:
+        logging.getLogger("saarthibhai.discord.embed").exception(
+            "Could not import Discord integration"
+        )
+        return
+
+    def runner() -> None:
+        try:
+            start_discord_bot()
+        except Exception:
+            logging.getLogger("saarthibhai.discord.embed").exception(
+                "Embedded Discord Gateway stopped"
+            )
+
+    _discord_embedded_thread = Thread(
+        target=runner,
+        name="saarthibhai-discord-gateway",
+        daemon=True,
+    )
+    _discord_embedded_thread.start()
+    _discord_embedded_started = True
+    logging.getLogger("saarthibhai.discord.embed").info(
+        "Embedded Discord Gateway thread started"
+    )
+
+
+_start_embedded_discord()
+
+
 if __name__ == "__main__":
     # threaded=True lets Flask's dev server handle multiple concurrent
     # requests (AI calls already run off-thread via the pool, so the web
     # worker itself must not block on them). For real production traffic,
-    # run behind gunicorn with multiple workers instead of this dev server:
-    #   gunicorn -w 4 -k gthread --threads 8 -b 0.0.0.0:$PORT studygenie_bot:app
+    # Production on Render Free: prefer http_interactions mode; keep ONE process when embedding a Gateway.
+    # session exists. Use: gunicorn --workers 1 --threads 4 app:app
     app.run(host="0.0.0.0", port=config.PORT, threaded=True)
