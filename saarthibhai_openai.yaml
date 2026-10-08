@@ -1,0 +1,78 @@
+openapi: 3.1.0
+info:
+  title: SaarthiBhai API
+  version: "8.1"
+  description: Config-driven study tools for SaarthiBhai by Sparsh Singhal.
+servers:
+  - url: https://saarthibhai-by-sparsh-singhal.onrender.com
+security:
+  - bearerAuth: []
+paths:
+  /api/ai/ask:
+    post:
+      operationId: askSaarthiBhai
+      summary: Ask SaarthiBhai a study question
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AskRequest'
+      responses:
+        '200': {description: Answer}
+        '401': {description: Unauthorized}
+        '429': {description: Rate limited}
+  /api/tool/notes:
+    post:
+      operationId: makeNotes
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/TopicRequest'}}}}
+      responses: {'200': {description: Notes}}
+  /api/tool/pyq:
+    post:
+      operationId: makePYQ
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/TopicRequest'}}}}
+      responses: {'200': {description: PYQ}}
+  /api/tool/ncert:
+    post:
+      operationId: ncertExplanation
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/TopicRequest'}}}}
+      responses: {'200': {description: NCERT-aligned explanation}}
+  /api/tool/important-questions:
+    post:
+      operationId: importantQuestions
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/TopicRequest'}}}}
+      responses: {'200': {description: Important questions}}
+  /api/tool/flashcards:
+    post:
+      operationId: flashcards
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/TopicRequest'}}}}
+      responses: {'200': {description: Flashcards}}
+  /api/tool/revision:
+    post:
+      operationId: revision
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [uid], properties: {uid: {type: string}}}}}}
+      responses: {'200': {description: Revision session}}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    TopicRequest:
+      type: object
+      required: [topic]
+      properties:
+        topic: {type: string}
+        question: {type: string}
+        uid: {type: string}
+        client_id: {type: string}
+        language: {type: string}
+        exam: {type: string}
+        subject: {type: string}
+    AskRequest:
+      allOf:
+        - $ref: '#/components/schemas/TopicRequest'
+      type: object
+      properties:
+        tool: {type: string}
+        phone_number: {type: string}
