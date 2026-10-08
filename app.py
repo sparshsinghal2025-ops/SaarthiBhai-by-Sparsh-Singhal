@@ -177,6 +177,9 @@ class Config:
         self.SPACED_REMINDER_DAYS = tuple(int(x) for x in _setting("limits.spaced_reminder_days"))
         self.MISSION_REWARD_COINS = int(_env_or_setting("MISSION_REWARD_COINS", "limits.mission_reward_coins"))
         self.QUIZ_PERFECT_COINS = int(_env_or_setting("QUIZ_PERFECT_COINS", "limits.quiz_perfect_coins"))
+        self.QUIZ_FREE_QUESTIONS = int(_env_or_setting("QUIZ_FREE_QUESTIONS", "limits.quiz_free_questions"))
+        self.QUIZ_PRO_QUESTIONS = int(_env_or_setting("QUIZ_PRO_QUESTIONS", "limits.quiz_pro_questions"))
+        self.GALTI_FREE_VISIBLE = int(_env_or_setting("GALTI_FREE_VISIBLE", "limits.galti_free_visible"))
         self.MISTAKE_COINS = int(_env_or_setting("MISTAKE_COINS", "limits.mistake_coins"))
         self.FREE_PDF_PER_DAY = int(_env_or_setting("FREE_PDF_PER_DAY", "limits.free_pdf_per_day"))
         self.FREE_VIDEO_LINKS = int(_env_or_setting("FREE_VIDEO_LINKS", "limits.free_video_links"))
@@ -189,6 +192,7 @@ class Config:
         self.WELCOME_FREE_SPIN_COUNT = int(_env_or_setting("WELCOME_FREE_SPIN_COUNT", "limits.welcome_free_spin_count"))
         self.WELCOME_FREEZE_COUNT = int(_env_or_setting("WELCOME_FREEZE_COUNT", "limits.welcome_freeze_count"))
         self.IMAGE_MAX_BYTES = int(_env_or_setting("IMAGE_MAX_BYTES", "limits.image_max_bytes"))
+        self.TELEGRAM_DOCUMENT_MAX_BYTES = int(_env_or_setting("TELEGRAM_DOCUMENT_MAX_BYTES", "limits.telegram_document_max_bytes"))
         self.ABUSE_WARNING_LIMIT = int(_env_or_setting("ABUSE_WARNING_LIMIT", "limits.abuse_warning_limit"))
         self.ABUSE_BAN_HOURS = int(_env_or_setting("ABUSE_BAN_HOURS", "limits.abuse_ban_hours"))
         abuse_words = _env("ABUSE_WORDS")
@@ -238,24 +242,25 @@ class Config:
         self.SNAPCHAT_DM_GATEWAY_URL = _env("SNAPCHAT_DM_GATEWAY_URL")
         self.SNAPCHAT_DM_GATEWAY_TOKEN = _env("SNAPCHAT_DM_GATEWAY_TOKEN")
 
-        # Discord / Reddit channel integrations. These are optional worker/app
-        # surfaces; they reuse the same database, quota, AI and safety pipeline.
-        self.DISCORD_ENABLED = (_env("DISCORD_ENABLED").lower() in ("1", "true", "yes")) if _env("DISCORD_ENABLED") else bool(_setting("channels.discord.enabled"))
+        # Discord HTTP interactions / optional Gateway worker. Disabled unless explicitly configured.
+        discord_cfg = _setting("channels.discord")
+        self.DISCORD_ENABLED = (_env("DISCORD_ENABLED").lower() in ("1","true","yes")) if _env("DISCORD_ENABLED") else bool(discord_cfg.get("enabled", False))
         self.DISCORD_BOT_TOKEN = _env("DISCORD_BOT_TOKEN")
         self.DISCORD_APPLICATION_ID = _env("DISCORD_APPLICATION_ID")
         self.DISCORD_PUBLIC_KEY = _env("DISCORD_PUBLIC_KEY")
         self.DISCORD_GUILD_ID = _env("DISCORD_GUILD_ID")
-        self.DISCORD_MESSAGE_CONTENT_INTENT = (_env("DISCORD_MESSAGE_CONTENT_INTENT").lower() in ("1", "true", "yes")) if _env("DISCORD_MESSAGE_CONTENT_INTENT") else bool(_setting("channels.discord.message_content_intent"))
+        self.DISCORD_MESSAGE_CONTENT_INTENT = (_env("DISCORD_MESSAGE_CONTENT_INTENT").lower() in ("1","true","yes")) if _env("DISCORD_MESSAGE_CONTENT_INTENT") else bool(discord_cfg.get("message_content_intent", False))
         self.DISCORD_MAX_RESPONSE_CHARS = int(_env_or_setting("DISCORD_MAX_RESPONSE_CHARS", "channels.discord.max_response_chars"))
         self.DISCORD_COMMAND_NAME = str(_env_or_setting("DISCORD_COMMAND_NAME", "channels.discord.command_name"))
         self.DISCORD_COMMAND_DESCRIPTION = str(_env_or_setting("DISCORD_COMMAND_DESCRIPTION", "channels.discord.command_description"))
         self.DISCORD_RUN_MODE = str(_env_or_setting("DISCORD_RUN_MODE", "channels.discord.run_mode")).strip().lower()
 
-        self.REDDIT_ENABLED = (_env("REDDIT_ENABLED").lower() in ("1", "true", "yes")) if _env("REDDIT_ENABLED") else bool(_setting("channels.reddit.enabled"))
+        reddit_cfg = _setting("channels.reddit")
+        self.REDDIT_ENABLED = (_env("REDDIT_ENABLED").lower() in ("1","true","yes")) if _env("REDDIT_ENABLED") else bool(reddit_cfg.get("enabled", False))
         self.REDDIT_BACKEND_TOKEN = _env("REDDIT_BACKEND_TOKEN")
         self.REDDIT_BACKEND_PATH = str(_env_or_setting("REDDIT_BACKEND_PATH", "channels.reddit.backend_path"))
         self.REDDIT_TRIGGER_PREFIX = str(_env_or_setting("REDDIT_TRIGGER_PREFIX", "channels.reddit.trigger_prefix"))
-        self.REDDIT_AUTO_REPLY = (_env("REDDIT_AUTO_REPLY").lower() in ("1", "true", "yes")) if _env("REDDIT_AUTO_REPLY") else bool(_setting("channels.reddit.auto_reply"))
+        self.REDDIT_AUTO_REPLY = (_env("REDDIT_AUTO_REPLY").lower() in ("1","true","yes")) if _env("REDDIT_AUTO_REPLY") else bool(reddit_cfg.get("auto_reply", True))
         self.REDDIT_MAX_REPLY_CHARS = int(_env_or_setting("REDDIT_MAX_REPLY_CHARS", "channels.reddit.max_reply_chars"))
 
         self.REDIS_MAX_CONN = int(_env_or_setting("REDIS_MAX_CONN", "runtime.redis_max_connections"))
@@ -347,10 +352,11 @@ def run_ai(fn, *args, **kwargs):
             return "ERROR: AI returned empty response."
         return result
     except FuturesTimeout:
-        return f"ERROR: AI timed out after {_AI_TIMEOUT:.0f}s."
+        logger.warning("AI pool timeout after %.1fs", _AI_TIMEOUT)
+        return SOFT_FAIL_MSG
     except Exception as e:
         logger.error("AI pool error: %s", e)
-        return f"ERROR: {e}"
+        return SOFT_FAIL_MSG
 
 
 
@@ -1064,9 +1070,11 @@ class Database:
                 ref_user["referral_count"] = str(count)
                 self.save_user(referrer_uid, ref_user)
                 self.add_xp(referrer_uid, 50)
-                # Every 5 successful referrals -> 3 free Pro days
-                if count % 5 == 0:
-                    self.activate_pro(referrer_uid, days=3)
+                growth_cfg = config.CONTENT.get("pro_growth", {})
+                referral_threshold = max(1, int(growth_cfg.get("referral_threshold", 3) or 3))
+                referral_days = max(1, int(growth_cfg.get("referral_days", 3) or 3))
+                if count % referral_threshold == 0:
+                    self.activate_pro(referrer_uid, days=referral_days)
             return True
         except Exception as e:
             logger.warning("apply_referral: %s", e)
@@ -2463,7 +2471,7 @@ class AIService:
         # does not turn every request into a giant context window.
         if config.LIBRARY_CONTEXT_ENABLED and tool in ("general", "explain", "notes", "ncert", "pyq", "important") and supa.enabled:
             try:
-                ex_tag, sub_tag = guess_exam_subject(question, exam_type, subject)
+                ex_tag, sub_tag = guess_exam_subject(question)
                 library_rows = db.search_library(question, ex_tag, sub_tag, limit=3)
                 if library_rows:
                     snippets = []
@@ -2491,18 +2499,12 @@ class AIService:
             "qwen": self._call_qwen,
             "openrouter": self._call_openrouter,
         }
-        # Tool-aware routing keeps easy questions on fast providers and lets
-        # deeper/longer tools naturally fall through to stronger models.
+        # Provider routing is fully configuration-driven.
         order = list(config.AI_PROVIDER_ORDER)
-        if tool in ("solve", "numerical", "derivation"):
-            preferred = ["deepseek", "gemini", "claude", "openai", "groq", "openrouter"]
-            order = preferred + [x for x in order if x not in preferred]
-        elif tool in ("career", "youtube", "current_affairs"):
-            preferred = ["perplexity", "openai", "gemini", "xai", "claude", "openrouter"]
-            order = preferred + [x for x in order if x not in preferred]
-        elif tool in ("essay", "resume", "planner", "notes"):
-            preferred = ["claude", "openai", "gemini", "xai", "groq", "openrouter"]
-            order = preferred + [x for x in order if x not in preferred]
+        for pref in config.CONTENT.get("provider_preferences_by_tool", {}).get(tool, []):
+            if pref in order:
+                order.remove(pref)
+        order = list(config.CONTENT.get("provider_preferences_by_tool", {}).get(tool, [])) + order
 
         seen = set()
         for name in order:
@@ -2893,7 +2895,7 @@ async def process_question(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     footer = f"\n\n━━━━━━━━━━━━━━━\n⚡ {elapsed:.1f}s | ⭐ +{xp_gain} XP{f' (Pro ×{config.PRO_XP_MULTIPLIER})' if is_pro else ''} | Level {level}\n" + config.CONTENT["footer_signature"].format(creator_name=config.CREATOR_NAME)
     full = answer + footer + _channel_resource_suffix(text, is_pro, uid)
     if len(full) <= 4096:
-        await reply(update, full)
+        await reply(update, full, _text_action_keyboard(is_pro))
     else:
         for i, chunk in enumerate([full[j:j + 4000] for j in range(0, len(full), 4000)]):
             if i == 0:
@@ -3287,6 +3289,7 @@ async def get_app() -> Application:
         app_.add_handler(CallbackQueryHandler(callback))
         app_.add_handler(MessageHandler(filters.CONTACT, handle_contact))
         app_.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+        app_.add_handler(MessageHandler(filters.Document.ALL, handle_document))
         app_.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text))
         app_.add_error_handler(error_handler)
         await app_.initialize()
@@ -4419,6 +4422,34 @@ function renderMsgMath(el){
     if(run() || tries > 20) clearInterval(t);
   }, 100);
 }
+function addQuickActions(actions, question){
+  if(!Array.isArray(actions) || !actions.length || !question) return;
+  const box=document.getElementById("messages");
+  const wrap=document.createElement("div");
+  wrap.className="quick-actions";
+  wrap.style.cssText="display:flex;flex-wrap:wrap;gap:.45rem;margin:.15rem 0 .75rem";
+  actions.forEach(a=>{
+    const b=document.createElement("button");
+    b.type="button";
+    b.textContent=String(a.label||a.id||"Action");
+    b.style.cssText="border:1px solid rgba(0,0,0,.12);border-radius:999px;padding:.48rem .7rem;background:#FFD600;color:#111;font-weight:700;cursor:pointer";
+    b.onclick=async()=>{
+      b.disabled=true;
+      try{
+        const r=await fetch("/api/quick-action",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({client_id:clientId,question:question,action:a.id})});
+        const d=await r.json();
+        if(d.pro_only){ addMessage("bot", d.error||"PRO feature hai."); return; }
+        if(d.videos){ addMessage("bot", d.videos.map(v=>`▶️ ${escapeHtml(v.title||"Video")}: ${escapeHtml(v.url||"")}`).join("\n")); return; }
+        addMessage("bot", d.answer || (d.quiz ? ("📝 Quiz\n\n"+JSON.stringify(d.quiz,null,2)) : "Done."));
+      }catch(e){ addMessage("bot", "Please try again."); }
+      finally{ b.disabled=false; }
+    };
+    wrap.appendChild(b);
+  });
+  box.appendChild(wrap);
+  box.scrollTop=box.scrollHeight;
+}
+
 function addMessage(role, text, meta=""){
   const div = document.createElement("div");
   div.className = "msg " + role;
@@ -4455,6 +4486,7 @@ async function ask(){
     const data = await res.json();
     loading.remove();
     addMessage("bot", data.answer || "No response", data.elapsed ? `⚡ ${data.elapsed}s` : "");
+    addQuickActions(data.actions, q);
     soundRecv();
     if(data.xp !== undefined && data.xp !== null){
       document.getElementById("xp-display").textContent = `⭐ ${data.xp} XP`;
@@ -4501,8 +4533,8 @@ async function loadLB(){
       list.innerHTML = "<div style='color:#64748b;font-size:.85rem'>No one yet</div>";
       return;
     }
-    list.innerHTML = data.board.slice(0,8).map(e=>
-      `<div class="lb-item"><span>${e.rank}. ${e.name}</span><span>L${e.level}</span></div>`
+    list.innerHTML = data.board.slice(0,10).map(e=>
+      `<div class="lb-item"><span>${e.rank}. ${e.name}${e.is_pro ? " 👑 PRO" : ""}</span><span>L${e.level}</span></div>`
     ).join("");
   }catch{}
 }
@@ -5047,6 +5079,28 @@ a.back{color:var(--accent);text-decoration:none;font-size:.85rem}
     <p id="createMsg" style="margin-top:.5rem;font-size:.85rem;color:var(--muted)"></p>
   </div>
 
+
+  <div class="card">
+    <h2>👑 Teacher Pro & Class Tools</h2>
+    <div id="teacherStatus" class="meta" style="margin-bottom:.75rem">Loading teacher plan...</div>
+    <button onclick="buyTeacherPro()">Unlock Teacher Pro ₹{{ teacher_pro_price }}</button>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:.7rem;margin-top:1rem">
+      <div>
+        <input type="text" id="taskClass" placeholder="Class code"/>
+        <input type="text" id="taskTitle" placeholder="Assignment/Test/Note title"/>
+        <textarea id="taskBody" placeholder="Instructions / topic / note" style="width:100%;min-height:90px;padding:.6rem;border-radius:8px;border:1px solid var(--border);background:#0f172a;color:var(--text)"></textarea>
+        <button onclick="saveTeacherTask('assignment')">Create Assignment</button>
+        <button onclick="saveTeacherTask('test')">Create Test</button>
+        <button onclick="saveTeacherTask('note')">Save Note</button>
+      </div>
+      <div>
+        <h3 style="margin-bottom:.5rem">Class Report</h3>
+        <button class="secondary" onclick="loadTeacherReport()">Refresh Report</button>
+        <pre id="teacherReport" style="white-space:pre-wrap;margin-top:.6rem;color:var(--muted)"></pre>
+      </div>
+    </div>
+  </div>
+
   <div class="card">
     <h2>📚 Your Classes</h2>
     <div id="classList" class="class-list"><p class="empty">Loading...</p></div>
@@ -5168,6 +5222,15 @@ function copyJoinLink(){
 
 loadClasses();
 </script>
+
+<script src="{{ razorpay_checkout_js }}"></script>
+<script>
+async function refreshTeacherStatus(){try{const r=await fetch('/api/teacher/status?client_id='+encodeURIComponent(teacherId));const d=await r.json();document.getElementById('teacherStatus').textContent=d.teacher_plan==='pro'?'👑 Teacher Pro active — '+d.max_classes+' classes / '+d.max_students_per_class+' students per class':'Free Teacher — '+d.max_classes+' class / '+d.max_students_per_class+' students per class';}catch(e){}}
+async function buyTeacherPro(){try{const r=await fetch('/api/teacher/create-order',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client_id:teacherId})});const d=await r.json();if(!d.ok){alert(d.error||'Could not create order');return;}if(!window.Razorpay){alert('Payment UI unavailable');return;}const rz=new Razorpay({key:'{{ razorpay_key_id }}',amount:d.amount,currency:d.currency||'INR',name:'{{ brand_name }}',description:'Teacher Pro',order_id:d.id,notes:{user_id:'web:'+teacherId},handler:async function(resp){const vr=await fetch('/api/teacher/verify-payment',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({payment_id:resp.razorpay_payment_id,order_id:resp.razorpay_order_id||d.id,client_id:teacherId})});const vd=await vr.json();alert(vd.message||vd.error||'Done');refreshTeacherStatus();}});rz.open();}catch(e){alert('Payment error');}}
+async function saveTeacherTask(kind){const cls=document.getElementById('taskClass').value.trim();const title=document.getElementById('taskTitle').value.trim();const body=document.getElementById('taskBody').value.trim();if(!cls||!title){alert('Class code and title required');return;}const path=kind==='assignment'?'/api/teacher/assignment':kind==='test'?'/api/teacher/test':'/api/teacher/note';const payload=kind==='assignment'?{client_id:teacherId,class_code:cls,title,instructions:body}:kind==='test'?{client_id:teacherId,class_code:cls,title,topic:body}:{client_id:teacherId,class_code:cls,title,content:body};const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const d=await r.json();alert(d.ok?'Saved':(d.error||'Failed'));}
+async function loadTeacherReport(){const cls=document.getElementById('taskClass').value.trim();if(!cls){alert('Class code required');return;}const r=await fetch('/api/teacher/class/'+encodeURIComponent(cls)+'/report');const d=await r.json();document.getElementById('teacherReport').textContent=d.ok?JSON.stringify(d,null,2):(d.error||'Failed');}
+refreshTeacherStatus();
+</script>
 </body>
 </html>
 """
@@ -5177,25 +5240,6 @@ loadClasses();
 # ============================================================================
 
 app = Flask(__name__)
-
-
-@app.route("/webhook/discord", methods=["POST"])
-def discord_interactions_webhook():
-    """Discord HTTP interactions endpoint; no persistent Gateway is required."""
-    raw = request.get_data(cache=True)
-    if not _discord_http_verify(raw):
-        return jsonify({"ok": False, "error": "invalid_signature"}), 401
-    payload = request.get_json(silent=True) or {}
-    interaction_type = int(payload.get("type") or 0)
-    if interaction_type == 1:
-        return jsonify({"type": 1}), 200
-    if interaction_type != 2:
-        return jsonify({"type": 4, "data": {"content": "SaarthiBhai currently supports /ask."}}), 200
-    # Acknowledge within Discord's deadline, then finish the AI work in a thread.
-    Thread(target=_discord_http_process, args=(payload,), daemon=True, name="discord-http-answer").start()
-    return jsonify({"type": 5}), 200
-
-
 
 SAARTHIBHAI_CORS_ORIGIN = config.CORS_ORIGIN
 @app.after_request
@@ -5407,7 +5451,16 @@ def api_create_order():
     order = create_razorpay_order(uid, config.PRO_PRICE_INR)
     if "error" in order:
         return jsonify(order), 400
-    return jsonify({"id": order.get("id"), "amount": order.get("amount"), "currency": order.get("currency", "INR")})
+    order_id = str(order.get("id") or "").strip()
+    if order_id and db.redis:
+        try:
+            db.redis.hset(f"pay:pending:{order_id}", mapping={
+                "uid": uid, "created_at": _now_ist().isoformat(), "status": "created",
+            })
+            db.redis.expire(f"pay:pending:{order_id}", 86400 * 10)
+        except Exception:
+            pass
+    return jsonify({"id": order_id, "amount": order.get("amount"), "currency": order.get("currency", "INR")})
 
 
 
@@ -5445,6 +5498,17 @@ def api_me():
         "phone_number": user.get("phone_number", ""),
         "exam_type": user.get("exam_type", "general"),
         "subject": user.get("subject", "general"),
+        "board": user.get("board", ""),
+        "course": user.get("course", ""),
+        "class_level": user.get("class_level", ""),
+        "semester": user.get("semester", ""),
+        "student_type": user.get("student_type", ""),
+        "learner_track": user.get("learner_track", "school_college"),
+        "study_mode": user.get("study_mode", ""),
+        "target_exam": user.get("target_exam", user.get("exam_type", "")),
+        "target_days": int(user.get("target_days", 0) or 0),
+        "parent_phone": user.get("parent_phone", ""),
+        "parent_report_opt_in": str(user.get("parent_report_opt_in", "0")).lower() in ("1","true","yes"),
         "welcome_just_claimed": _pop_welcome_flash(uid),
         "welcome": {"coins": config.WELCOME_COINS, "spin_min": config.SPIN_MIN_COINS, "spin_max": config.SPIN_MAX_COINS, "spin_count": config.WELCOME_FREE_SPIN_COUNT, "freeze": config.WELCOME_FREEZE_COUNT},
     })
@@ -5522,12 +5586,6 @@ def health():
         "build_line_count": BUILD_LINE_COUNT,
         "creator": config.CREATOR_NAME,
         "features": _feature_status(),
-        "discord_diagnostics": {
-            "application_id_present": bool(config.DISCORD_APPLICATION_ID),
-            "guild_id_present": bool(config.DISCORD_GUILD_ID),
-            "run_mode": config.DISCORD_RUN_MODE,
-            **_discord_public_key_diagnostics(),
-        },
     })
 
 
@@ -5562,11 +5620,6 @@ def _feature_status() -> Dict[str, Any]:
             "exam_bomb_cron_route": True,
         },
         "ready": {
-            "discord_worker": bool(config.DISCORD_ENABLED and config.DISCORD_BOT_TOKEN),
-            "discord_mode": config.DISCORD_RUN_MODE,
-            "discord_http_interactions": bool(config.DISCORD_ENABLED and config.DISCORD_APPLICATION_ID and config.DISCORD_PUBLIC_KEY and config.DISCORD_RUN_MODE == "http_interactions"),
-            "discord_embedded_web": bool(config.DISCORD_ENABLED and config.DISCORD_BOT_TOKEN and config.DISCORD_RUN_MODE == "embedded_web"),
-            "reddit_devvit_bridge": bool(config.REDDIT_ENABLED and config.REDDIT_BACKEND_TOKEN),
             "razorpay_payments": bool(config.RAZORPAY_KEY_ID and config.RAZORPAY_KEY_SECRET),
             "razorpay_webhook_verified": bool(config.RAZORPAY_WEBHOOK_SECRET),
             "whatsapp_surface": bool(config.WHATSAPP_TOKEN and config.WHATSAPP_PHONE_NUMBER_ID),
@@ -5690,15 +5743,13 @@ def web_ask():
     soft = "Target almost locked" in str(answer or "")
     if (not answer) or str(answer).startswith("ERROR:") or soft:
         logger.warning("AI failure for uid=%s tool=%s reason=%s", uid, tool, (answer or "")[:120])
+        fallback = _fallback_youtube_answer(q, is_pro, db.get_language(uid))
         return jsonify({
-            "answer": (
-                "🎯 Target almost locked!\n\n"
-                "SaarthiBhai abhi thoda busy hai (free servers pe heavy traffic).\n"
-                "15–20 second baad dubara **Fire** dabao — zyada tar sawaal tab clear ho jaate hain.\n\n"
-                "Tip: simple / short sawaal try karo, ya thodi der baad.\n"
-                "Pro plan = unlimited + priority.\n\n"
-                + config.CONTENT["footer_signature"].format(creator_name=config.CREATOR_NAME)
-            )
+            "answer": fallback,
+            "resources": _10in1_metadata(q, is_pro, uid),
+            "actions": TEXT_ACTIONS,
+            "fallback": True,
+            "brand": BRAND_NAME,
         })
     if not is_pro:
         pass  # already consumed atomically above via try_consume_quota
@@ -5736,7 +5787,7 @@ def web_ask():
     return jsonify({"answer": answer + footer, "xp": xp, "level": level, "rank": rank, "quota": quota,
                      "elapsed": round(elapsed, 2), "cached": cached, "numerical": web_numerical,
                      "coins": db.get_coins(uid), "language": db.get_language(uid), "streak": streak_info,
-                     "resources": resources, "brand": BRAND_NAME,
+                     "resources": resources, "actions": TEXT_ACTIONS, "brand": BRAND_NAME,
                      "plan_compare": {
             "free": config.PRODUCT_TEXT["free_plan_compare"].format(
                 free_daily=config.FREE_DAILY, free_pdf_per_day=config.FREE_PDF_PER_DAY,
@@ -5750,7 +5801,8 @@ def web_ask():
 
 @app.route("/api/leaderboard")
 def api_leaderboard():
-    return jsonify({"board": db.get_leaderboard(15), "live": True})
+    top_n=max(1,int(TEXT_PRO_GROWTH.get("leaderboard_top_n",10) or 10))
+    return jsonify({"board": db.get_leaderboard(top_n), "live": True})
 
 
 @app.route("/api/leaderboard/referrals")
@@ -5836,13 +5888,17 @@ def api_set_parent_phone():
     """POINT 26 — save parent's WhatsApp number for weekly reports."""
     data = request.get_json(silent=True) or {}
     client_id = (data.get("client_id") or "").strip()
-    phone = (data.get("phone") or "").strip()
+    phone = (data.get("parent_phone") or data.get("phone") or "").strip()
+    opt_in = bool(data.get("opt_in", True))
     if not client_id or not phone:
         return jsonify({"ok": False, "error": "client_id and phone required"}), 400
     uid = f"web:{client_id}"
     db.ensure_user(uid, full_name=config.DEFAULT_STUDENT_NAMES["web"], platform="web")
     ok = db.set_parent_phone(uid, phone)
-    return jsonify({"ok": bool(ok)})
+    user = db.get_user(uid) or {}
+    user["parent_report_opt_in"] = "1" if opt_in else "0"
+    db.save_user(uid, user); db.sync_user_to_supabase(uid, user)
+    return jsonify({"ok": bool(ok), "opt_in": opt_in})
 
 
 # ----------------------------------------------------------------------
@@ -5898,7 +5954,7 @@ def api_quiz_generate():
                              "upsell": True}), 403
         if mode != "practice":
             return jsonify({"ok": False, "error": "Exam mode and 1v1 challenges are Pro-only.", "upsell": True}), 403
-        n_questions = 3
+        n_questions = config.QUIZ_FREE_QUESTIONS
     else:
         n_questions = max(1, min(int(data.get("n_questions", 10)), 20))
 
@@ -7589,113 +7645,6 @@ def api_resource_viva():
     return jsonify({"ok":True,"viva":ans})
 
 
-
-# ---------------------------------------------------------------------------
-# REDDIT / DEVVIT BRIDGE
-# Reddit's current supported automation path is a Devvit app trigger. The
-# Devvit worker forwards a qualifying comment here, then posts the returned
-# answer back to Reddit as the SaarthiBhai app account. This endpoint is kept
-# idempotent so trigger retries never double-charge a student or double-answer.
-# ---------------------------------------------------------------------------
-def _reddit_authorized() -> bool:
-    if not config.REDDIT_ENABLED or not config.REDDIT_BACKEND_TOKEN:
-        return False
-    auth = request.headers.get("Authorization", "")
-    return hmac.compare_digest(auth, f"Bearer {config.REDDIT_BACKEND_TOKEN}")
-
-
-@app.route("/webhook/reddit", methods=["POST"])
-def reddit_webhook_bridge():
-    if not _reddit_authorized():
-        return jsonify({"ok": False, "error": "unauthorized"}), 403
-    body = request.get_json(silent=True) or {}
-    event_id = str(body.get("event_id") or body.get("comment_id") or secrets.token_hex(12)).strip()
-    text_msg = str(body.get("text") or body.get("comment_body") or "").strip()
-    author_id = str(body.get("author_id") or body.get("author_name") or "anonymous").strip()
-    author_name = str(body.get("author_name") or "Reddit Student").strip()
-    subreddit = str(body.get("subreddit") or "").strip()
-    comment_id = str(body.get("comment_id") or "").strip()
-
-    if not text_msg:
-        return jsonify({"ok": True, "ignored": True, "reason": "empty"})
-    if not config.REDDIT_AUTO_REPLY:
-        return jsonify({"ok": True, "ignored": True, "reason": "auto_reply_disabled"})
-    if config.REDDIT_TRIGGER_PREFIX and config.REDDIT_TRIGGER_PREFIX.lower() not in text_msg.lower():
-        return jsonify({"ok": True, "ignored": True, "reason": "trigger_not_found"})
-
-    if db.redis:
-        try:
-            if not db.redis.set(f"reddit:event:{event_id}", "1", nx=True, ex=86400 * 7):
-                return jsonify({"ok": True, "duplicate": True})
-        except Exception:
-            pass
-
-    uid = f"reddit:{author_id}"
-    db.ensure_user(uid, full_name=author_name or config.DEFAULT_STUDENT_NAMES["generic"], platform="reddit")
-    db.set_channel_identity(uid, "reddit_user_id", author_id)
-    if subreddit:
-        db.set_channel_identity(uid, "reddit_subreddit", subreddit)
-
-    if db.is_banned(uid):
-        return jsonify({"ok": True, "reply": format_ban_active_message(db.get_ban_remaining_seconds(uid))})
-    if contains_abuse(text_msg):
-        count, just_banned = db.record_abuse_warning(uid)
-        return jsonify({"ok": True, "reply": format_abuse_warning_message(count, just_banned), "moderation": True})
-
-    # Strip the trigger word while keeping the actual student question.
-    cleaned = text_msg.strip()
-    if config.REDDIT_TRIGGER_PREFIX:
-        cleaned = re.sub(re.escape(config.REDDIT_TRIGGER_PREFIX), "", cleaned, count=1, flags=re.IGNORECASE).strip(" :,-")
-    if not cleaned:
-        cleaned = "Bhai mujhe padhai me help chahiye — aaj kya padhna chahiye?"
-
-    is_pro = db.is_pro(uid)
-    tool = detect_tool_from_text(cleaned)
-    if tool in config.PRO_ONLY_TOOLS and not is_pro:
-        return jsonify({"ok": True, "reply": config.PRODUCT_TEXT["pro_tool"] + f" Upgrade ₹{config.PRO_PRICE_INR}/30 days."})
-    if not is_pro:
-        can, quota = db.try_consume_quota(uid)
-        if not can:
-            return jsonify({"ok": True, "reply": config.PRODUCT_TEXT["free_limit"] + " — kal phir aa jana."})
-
-    user = db.get_user(uid) or {}
-    answer = get_ai_answer_v7(
-        cleaned,
-        tool,
-        is_pro,
-        language=db.get_language(uid),
-        phone_number=user.get("phone_number", ""),
-        exam_type=user.get("exam_type", ""),
-        subject=user.get("subject", ""),
-    ) or config.SYSTEM_PROTOCOL["public_error_no_response"]
-
-    db.track_activity(uid)
-    try:
-        ex, sub = guess_exam_subject(cleaned, user.get("exam_type", ""), user.get("subject", ""))
-        user["exam_type"], user["subject"] = ex, sub
-        user["last_question_at"] = _now_ist().isoformat()
-        db.save_user(uid, user)
-        db.sync_user_to_supabase(uid, user)
-        db.add_personal_history(uid, cleaned, tool=tool, exam_type=ex, subject=sub, source_cache="reddit")
-        schedule_spaced_reminders(uid, cleaned, tool)
-        xp, level = db.add_xp(uid, config.XP_QUESTION * (config.PRO_XP_MULTIPLIER if is_pro else 1))
-        if db.redis:
-            db.redis.hincrby(db._key(uid), "questions_asked", 1)
-            db.redis.incr("stats:total_questions")
-    except Exception as exc:
-        logger.warning("Reddit profile sync failed: %s", exc)
-        xp, level = 0, int(user.get("level", 1) or 1)
-
-    return jsonify({
-        "ok": True,
-        "reply": answer[:config.REDDIT_MAX_REPLY_CHARS],
-        "comment_id": comment_id,
-        "subreddit": subreddit,
-        "xp": xp,
-        "level": level,
-    })
-
-
 @app.route("/api/cron/backup", methods=["GET", "POST"])
 def cron_backup():
     if not _cron_authorized() or not supa.enabled:
@@ -7713,209 +7662,1505 @@ def cron_backup():
     return jsonify({"ok": ok, "users": len(snapshot["users"])})
 
 
-# ---------------------------------------------------------------------------
-# Discord HTTP-interactions mode (Render Free compatible)
-# ---------------------------------------------------------------------------
-
-try:
-    from nacl.exceptions import BadSignatureError
-    from nacl.signing import VerifyKey
-except Exception:  # dependency is installed via requirements.txt in this build
-    BadSignatureError = Exception
-    VerifyKey = None
 
 
-def _discord_public_key_diagnostics() -> dict:
-    key = (config.DISCORD_PUBLIC_KEY or "").strip()
-    hex_ok = False
-    parse_ok = False
-    try:
-        hex_ok = len(key) == 64 and all(c in "0123456789abcdefABCDEF" for c in key)
-        if hex_ok and VerifyKey is not None:
-            VerifyKey(bytes.fromhex(key))
-            parse_ok = True
-    except Exception:
-        parse_ok = False
-    preview = ""
-    if key:
-        preview = key[:8] + "..." + key[-8:] if len(key) >= 16 else key
-    return {
-        "configured": bool(key),
-        "length": len(key),
-        "hex_64": hex_ok,
-        "verifykey_parseable": parse_ok,
-        "preview": preview,
-        "verifier_library_loaded": VerifyKey is not None,
-    }
+# --- WhatsApp interactive menu / button replies (config-driven) --------------
+_ORIG_WA_SEND_TEXT = _send_whatsapp_text
 
-
-def _discord_http_verify(raw_body: bytes) -> bool:
-    diag = _discord_public_key_diagnostics()
-    signature = request.headers.get("X-Signature-Ed25519", "")
-    timestamp = request.headers.get("X-Signature-Timestamp", "")
-    if not diag["configured"] or not diag["verifykey_parseable"]:
-        logger.error(
-            "Discord signature verify unavailable: key_configured=%s length=%s hex64=%s parseable=%s verifier=%s",
-            diag["configured"], diag["length"], diag["hex_64"], diag["verifykey_parseable"], diag["verifier_library_loaded"]
-        )
-        return False
-    if len(signature) != 128 or not timestamp:
-        logger.error(
-            "Discord signature verify rejected headers: signature_len=%s timestamp_present=%s",
-            len(signature), bool(timestamp)
-        )
+def _send_whatsapp_interactive_menu(to_number: str) -> bool:
+    if not config.WHATSAPP_TOKEN or not config.WHATSAPP_PHONE_NUMBER_ID:
         return False
     try:
-        VerifyKey(bytes.fromhex((config.DISCORD_PUBLIC_KEY or "").strip())).verify(
-            timestamp.encode("utf-8") + raw_body,
-            bytes.fromhex(signature),
-        )
-        return True
-    except (ValueError, BadSignatureError):
-        logger.error(
-            "Discord signature mismatch: key_preview=%s signature_len=%s timestamp_present=%s raw_len=%s",
-            diag["preview"], len(signature), bool(timestamp), len(raw_body)
-        )
+        url=f"{config.URLS['whatsapp_graph_base_url']}/{config.WHATSAPP_API_VERSION}/{config.WHATSAPP_PHONE_NUMBER_ID}/messages"
+        headers={"Authorization":f"Bearer {config.WHATSAPP_TOKEN}","Content-Type":"application/json"}
+        rows=[{"id":str(x.get('id')),"title":str(x.get('title'))[:24]} for x in TEXT_WHATSAPP_MENU[:10]]
+        payload={"messaging_product":"whatsapp","to":to_number,"type":"interactive","interactive":{"type":"list","body":{"text":config.CONTENT.get('whatsapp_welcome_text','Kya chahiye?')},"action":{"button":config.CONTENT.get('whatsapp_menu_button','Open Menu')[:20],"sections":[{"title":config.CONTENT.get('whatsapp_menu_section','SaarthiBhai'),"rows":rows}]}}}
+        r=requests.post(url,json=payload,headers=headers,timeout=15)
+        return r.status_code<300
+    except Exception as e:
+        logger.warning('WhatsApp interactive menu: %s',e); return False
+
+
+def _send_whatsapp_document(to_number: str, url: str, caption: str = '') -> bool:
+    if not config.WHATSAPP_TOKEN or not config.WHATSAPP_PHONE_NUMBER_ID or not url:
         return False
-
-
-def _discord_http_register_command() -> bool:
-    if not (config.DISCORD_ENABLED and config.DISCORD_BOT_TOKEN and config.DISCORD_APPLICATION_ID):
-        return False
-    command = {
-        "name": config.DISCORD_COMMAND_NAME,
-        "description": config.DISCORD_COMMAND_DESCRIPTION,
-        "type": 1,
-        "options": [{
-            "name": "question",
-            "description": "Padhai ka sawaal",
-            "type": 3,
-            "required": True,
-            "max_length": 1800,
-        }],
-    }
-    url = f"https://discord.com/api/v10/applications/{config.DISCORD_APPLICATION_ID}/guilds/{config.DISCORD_GUILD_ID}/commands" if config.DISCORD_GUILD_ID else f"https://discord.com/api/v10/applications/{config.DISCORD_APPLICATION_ID}/commands"
     try:
-        r = requests.post(
-            url,
-            headers={"Authorization": f"Bot {config.DISCORD_BOT_TOKEN}", "Content-Type": "application/json"},
-            json=command,
-            timeout=15,
-        )
-        if not r.ok:
-            logger.error("Discord HTTP command registration failed: %s %s", r.status_code, r.text[:500])
-            return False
-        logger.info("Discord HTTP slash command registered: /%s", config.DISCORD_COMMAND_NAME)
-        return True
-    except Exception:
-        logger.exception("Discord HTTP command registration error")
-        return False
+        api=f"{config.URLS['whatsapp_graph_base_url']}/{config.WHATSAPP_API_VERSION}/{config.WHATSAPP_PHONE_NUMBER_ID}/messages"
+        headers={"Authorization":f"Bearer {config.WHATSAPP_TOKEN}","Content-Type":"application/json"}
+        payload={"messaging_product":"whatsapp","to":to_number,"type":"document","document":{"link":url,"caption":caption[:1024]}}
+        r=requests.post(api,json=payload,headers=headers,timeout=15)
+        return r.status_code<300
+    except Exception as e:
+        logger.warning('WhatsApp document: %s',e); return False
 
 
-def _discord_http_edit_original(interaction_token: str, content: str) -> None:
-    if not config.DISCORD_APPLICATION_ID:
+def _process_whatsapp_button(from_number: str, button_id: str, profile_name: str = '') -> None:
+    item=next((x for x in TEXT_WHATSAPP_MENU if str(x.get('id'))==str(button_id)),None)
+    if not item: return
+    tool=str(item.get('tool') or 'general')
+    _ORIG_PROCESS_WA = process_whatsapp_message
+    if tool=='youtube':
+        user=db.ensure_user(f'wa:{from_number}',full_name=profile_name or config.DEFAULT_STUDENT_NAMES['generic'],platform='whatsapp',phone_number=from_number)
+        links=_youtube_links(str(user.get('subject') or user.get('exam_type') or 'study'),config.PRO_VIDEO_LINKS if db.is_pro(f'wa:{from_number}') else config.FREE_VIDEO_LINKS)
+        body='\n'.join([f"▶️ {x.get('title')}: {x.get('url')}" for x in links])
+        _ORIG_WA_SEND_TEXT(from_number,body or config.SYSTEM_PROTOCOL.get('public_error_no_response','No answer'))
         return
-    url = f"https://discord.com/api/v10/webhooks/{config.DISCORD_APPLICATION_ID}/{interaction_token}/messages/@original"
+    # Tool button alone has no text question; guide the student to send the topic.
+    _ORIG_WA_SEND_TEXT(from_number, f"{item.get('title',tool)} select ho gaya. Ab topic/question bhej de bhai.")
+
+
+# Replace the existing WhatsApp webhook with an additive route alias for interactive payloads.
+@app.route('/webhook/whatsapp-interactive', methods=['POST'])
+def whatsapp_interactive_alias():
+    body=request.get_json(silent=True) or {}
+    for ent in body.get('entry',[]):
+        for change in ent.get('changes',[]):
+            value=change.get('value',{}); contacts=value.get('contacts',[]); profile=(contacts[0].get('profile',{}).get('name','') if contacts else '')
+            for msg in value.get('messages',[]):
+                if msg.get('type')=='interactive':
+                    inter=msg.get('interactive') or {}; button=((inter.get('list_reply') or {}).get('id') or (inter.get('button_reply') or {}).get('id') or '')
+                    sender=str(msg.get('from') or '')
+                    if sender and button: _process_whatsapp_button(sender,button,profile)
+    return jsonify({'ok':True})
+
+# Greeting menu: additive wrapper used by deployments that call the alias route.
+@app.route('/webhook/whatsapp-menu', methods=['POST'])
+def whatsapp_menu_alias():
+    body=request.get_json(silent=True) or {}
+    for ent in body.get('entry',[]):
+        for change in ent.get('changes',[]):
+            value=change.get('value',{}); contacts=value.get('contacts',[]); profile=(contacts[0].get('profile',{}).get('name','') if contacts else '')
+            for msg in value.get('messages',[]):
+                if msg.get('type')!='text': continue
+                sender=str(msg.get('from') or ''); text=str((msg.get('text') or {}).get('body') or '').strip().lower()
+                if sender and text in {'hi','hello','hey','start','namaste'}:
+                    if not _send_whatsapp_interactive_menu(sender): _ORIG_WA_SEND_TEXT(sender,config.CONTENT.get('whatsapp_welcome_text','Kya chahiye?'))
+                elif sender:
+                    process_whatsapp_message(sender,text,profile)
+    return jsonify({'ok':True})
+
+
+
+# ============================================================================
+# SAARTHIBHAI 12-POINT TEXT FEATURE PACK — additive, config-driven layer
+# Everything business/content related is loaded from saarthibhai.config.json;
+# secrets remain environment-only.
+# ============================================================================
+
+TEXT_FEATURES = config.CONTENT
+TEXT_RUNTIME = RUNTIME_CONFIG.get("runtime", {})
+TEXT_PRO_GROWTH = TEXT_FEATURES.get("pro_growth", {})
+TEXT_STUDENT_TYPES = TEXT_FEATURES.get("student_types", {})
+TEXT_FEATURES_ACCESS = TEXT_FEATURES.get("feature_access", {})
+TEXT_ACTIONS = TEXT_FEATURES.get("answer_actions", [])
+TEXT_WHATSAPP_MENU = TEXT_FEATURES.get("whatsapp_menu", [])
+TEXT_FALLBACK = TEXT_FEATURES.get("fallback_messages", {})
+TEXT_REMINDERS = TEXT_FEATURES.get("reminder_messages", {})
+TEXT_MARKETING = TEXT_FEATURES.get("marketing", {})
+TEXT_PHD_TOOLS = TEXT_FEATURES.get("phd_tools", [])
+
+
+def _text_action_keyboard(is_pro: bool = False):
+    rows=[]
+    for action in TEXT_ACTIONS:
+        label=str(action.get("label") or action.get("id") or "Action")
+        tool=str(action.get("tool") or "general")
+        locked=(tool in PRO_ONLY_TOOLS and not is_pro)
+        shown=("🔒 " if locked else "")+label
+        rows.append(InlineKeyboardButton(shown[:64], callback_data=f"textaction_{action.get('id','general')}"))
+    if not rows:
+        return None
+    return InlineKeyboardMarkup([rows[i:i+2] for i in range(0,len(rows),2)])
+
+
+# --- Extra profile state in Supabase (all values are user-configurable) ----
+_ORIG_SYNC_AFTER_TEXT = Database.sync_user_to_supabase
+
+def _sync_user_with_text_profile(self, uid, user=None):
+    u = user or self.get_user(uid)
+    ok = _ORIG_SYNC_AFTER_TEXT(self, uid, u)
     try:
-        r = requests.patch(url, json={"content": content[:config.DISCORD_MAX_RESPONSE_CHARS]}, timeout=20)
-        if not r.ok:
-            logger.error("Discord HTTP follow-up failed: %s %s", r.status_code, r.text[:500])
-    except Exception:
-        logger.exception("Discord HTTP follow-up exception")
+        if self.supabase.enabled and u:
+            phone = normalize_phone(u.get("phone_number", ""))
+            if phone:
+                extra = {
+                    "board": u.get("board", "") or "",
+                    "course": u.get("course", "") or "",
+                    "class_level": u.get("class_level", "") or "",
+                    "semester": u.get("semester", "") or "",
+                    "student_type": u.get("student_type", "") or "",
+                    "target_exam": u.get("target_exam", u.get("exam_type", "")) or "",
+                    "study_mode": u.get("study_mode", "") or "",
+                    "target_days": int(u.get("target_days", 0) or 0) if str(u.get("target_days", "")).strip() else None,
+                    "parent_report_opt_in": str(u.get("parent_report_opt_in", "0")).lower() in ("1","true","yes"),
+                    "teacher_plan": u.get("teacher_plan", "free") or "free",
+                    "teacher_pro_until": u.get("teacher_pro_until") or None,
+                    "last_pro_reminder_at": u.get("last_pro_reminder_at") or None,
+                    "snapchat_streak": int(u.get("snapchat_streak", 0) or 0),
+                    "snapchat_last_seen": u.get("snapchat_last_seen") or None,
+                }
+                _DB_WRITE_POOL.submit(self.supabase.upsert, "users", {"phone_number": phone, **extra}, "phone_number")
+    except Exception as e:
+        logger.debug("text profile sync skipped: %s", e)
+    return ok
+
+Database.sync_user_to_supabase = _sync_user_with_text_profile
 
 
-def _discord_http_process(interaction: dict) -> None:
+def _text_profile_for_uid(uid: str | int) -> dict:
     try:
-        user = interaction.get("member", {}).get("user") or interaction.get("user") or {}
-        user_id = str(user.get("id") or "")
-        display_name = str(user.get("global_name") or user.get("username") or "Discord Student")
-        options = interaction.get("data", {}).get("options") or []
-        question = ""
-        for option in options:
-            if option.get("name") == config.DISCORD_COMMAND_NAME:
-                question = str(option.get("value") or "")
-            elif option.get("type") == 3:
-                question = str(option.get("value") or "")
-        if not user_id or not question.strip():
-            _discord_http_edit_original(interaction.get("token", ""), "Bhai question bhej 😄")
-            return
-        from types import SimpleNamespace
-        from discord_bot import answer_for_user
-        answer = asyncio.run(answer_for_user(SimpleNamespace(id=int(user_id), display_name=display_name, name=display_name), question, "discord"))
-        _discord_http_edit_original(interaction.get("token", ""), answer)
+        return db.get_user(uid) or {}
     except Exception:
-        logger.exception("Discord HTTP interaction processing failed")
-        _discord_http_edit_original(interaction.get("token", ""), config.SYSTEM_PROTOCOL["public_error_no_response"])
+        return {}
 
 
-def _discord_http_endpoint_ready() -> bool:
-    return bool(config.DISCORD_ENABLED and config.DISCORD_APPLICATION_ID and config.DISCORD_PUBLIC_KEY)
+def _apply_student_profile_prompt(question: str, uid: str | int = "", phone_number: str = "") -> str:
+    user = _text_profile_for_uid(uid) if uid else {}
+    if not user and phone_number:
+        p = normalize_phone(phone_number)
+        if p and supa.enabled:
+            row = supa.select_one("users", {"phone_number": f"eq.{p}"}) or {}
+            user = {k: (json.dumps(v) if isinstance(v, (dict, list)) else ("" if v is None else str(v))) for k,v in row.items()}
+    student_type = str(user.get("student_type", "")).strip().lower()
+    bits = []
+    if student_type and student_type in TEXT_STUDENT_TYPES:
+        bits.append(str(TEXT_STUDENT_TYPES[student_type].get("prompt", "")))
+    for key, label in (("board","Board"),("course","Course"),("class_level","Class/Sem"),("semester","Semester"),("target_exam","Target Exam"),("subject","Subject")):
+        value = str(user.get(key, "")).strip()
+        if value:
+            bits.append(f"{label}: {value}")
+    target_days = int(user.get("target_days", 0) or 0)
+    if target_days:
+        bits.append(f"Days to target exam: {target_days}")
+    if not bits:
+        return question
+    return "STUDENT PROFILE CONTEXT:\n" + "\n".join(bits) + "\n\nSTUDENT QUESTION:\n" + question
 
 
-# ---------------------------------------------------------------------------
-# Discord free-Render mode
-# ---------------------------------------------------------------------------
-_discord_embedded_thread = None
-_discord_embedded_started = False
+# Student mode context: Type-2 learners can switch Board Mode / Competitive Mode without changing identity.
+_ORIG_APPLY_PROFILE_TEXT = _apply_student_profile_prompt
+def _apply_student_profile_prompt_v9(question: str, uid: str | int = "", phone_number: str = "") -> str:
+    enriched = _ORIG_APPLY_PROFILE_TEXT(question, uid=uid, phone_number=phone_number)
+    user = _text_profile_for_uid(uid) if uid else {}
+    mode = str(user.get('study_mode','')).strip().lower()
+    if mode:
+        mode_cfg = next((m for m in TEXT_FEATURES.get('study_modes',[]) if str(m.get('id','')).lower()==mode), None)
+        if mode_cfg:
+            return f"STUDY MODE: {mode_cfg.get('label','')}\n{mode_cfg.get('prompt','')}\n\n{enriched}"
+    return enriched
+_apply_student_profile_prompt = _apply_student_profile_prompt_v9
+
+# --- Resilient 3-stage fallback: provider chain -> saved answer -> YouTube ---
+_ORIG_GET_AI_V8_BASE = get_ai_answer_v7
+
+def _fallback_youtube_answer(question: str, is_pro: bool, language: str = "hinglish") -> str:
+    links = _youtube_links(question, config.PRO_VIDEO_LINKS if is_pro else config.FREE_VIDEO_LINKS, language=language)
+    lines = [str(TEXT_FALLBACK.get("busy", "")).strip()]
+    for item in links:
+        lines.append(f"▶️ {item.get('title','Relevant video')}: {item.get('url','')}")
+    return "\n\n".join([x for x in lines if x])
 
 
-def _start_embedded_discord() -> None:
-    global _discord_embedded_thread, _discord_embedded_started
-    if _discord_embedded_started or not config.DISCORD_ENABLED:
-        return
-    if config.DISCORD_RUN_MODE == "http_interactions":
-        if _discord_http_endpoint_ready():
-            _discord_http_register_command()
-            logger.info("Discord HTTP interactions mode enabled at /webhook/discord")
-        else:
-            logger.warning("Discord HTTP interactions mode enabled but DISCORD_APPLICATION_ID/DISCORD_PUBLIC_KEY are missing")
-        return
-    if config.DISCORD_RUN_MODE != "embedded_web":
-        logging.getLogger("saarthibhai.discord.embed").info(
-            "Discord embedded web mode disabled; run_mode=%s", config.DISCORD_RUN_MODE
-        )
-        return
-    if not config.DISCORD_BOT_TOKEN:
-        logging.getLogger("saarthibhai.discord.embed").warning(
-            "DISCORD_ENABLED=true but DISCORD_BOT_TOKEN is empty; Discord not started"
-        )
-        return
-
-    try:
-        from discord_bot import start_discord_bot
-    except Exception:
-        logging.getLogger("saarthibhai.discord.embed").exception(
-            "Could not import Discord integration"
-        )
-        return
-
-    def runner() -> None:
+def get_ai_answer_v8(question: str, tool: str, is_pro: bool, language: str = "hinglish",
+                     phone_number: str = "", exam_type: str = "", subject: str = "", uid: str = ""):
+    enriched = _apply_student_profile_prompt(question, uid=uid, phone_number=phone_number)
+    # Single-flight: if many students ask the same theory question at once, one
+    # provider call wins and everyone else reuses the saved answer. This is
+    # config-driven and falls back safely when Redis is unavailable.
+    flight_key = None
+    flight_owner = False
+    if db.redis and bool(TEXT_RUNTIME.get("ai_queue_enabled", True)) and tool not in _NEVER_CACHE_TOOLS:
         try:
-            start_discord_bot()
+            flight_key = "aiflight:" + hashlib.sha256((tool+"|"+language+"|"+question.strip().lower()).encode("utf-8")).hexdigest()
+            flight_owner = bool(db.redis.set(flight_key, "1", nx=True, ex=int(TEXT_RUNTIME.get("ai_singleflight_wait_sec",18) or 18)))
+            if not flight_owner:
+                deadline=time.time()+float(TEXT_RUNTIME.get("ai_singleflight_wait_sec",18) or 18)
+                while time.time()<deadline:
+                    cached=db.cache_get(make_cache_key(tool,question,is_pro,language))
+                    if cached:
+                        return cached
+                    time.sleep(0.35)
+                durable=db.get_master_cache(question,tool=tool,exam_type=exam_type,subject=subject,phone_number=phone_number)
+                if durable and durable.get("answer"):
+                    return str(durable["answer"])
         except Exception:
-            logging.getLogger("saarthibhai.discord.embed").exception(
-                "Embedded Discord Gateway stopped"
-            )
+            flight_key=None; flight_owner=False
+    result = _ORIG_GET_AI_V8_BASE(enriched, tool, is_pro, language=language, phone_number=phone_number, exam_type=exam_type, subject=subject)
+    if flight_owner and flight_key and db.redis:
+        try: db.redis.delete(flight_key)
+        except Exception: pass
+    if result and str(result).strip() and str(result).strip() != SOFT_FAIL_MSG.strip():
+        return result
+    # Saved theory answer after provider failure.
+    if tool not in _NEVER_CACHE_TOOLS:
+        try:
+            durable = db.get_master_cache(question, tool=tool, exam_type=exam_type, subject=subject, phone_number=phone_number)
+            if durable and durable.get("answer"):
+                return str(durable["answer"])
+        except Exception:
+            pass
+    return _fallback_youtube_answer(question, is_pro, language)
 
-    _discord_embedded_thread = Thread(
-        target=runner,
-        name="saarthibhai-discord-gateway",
-        daemon=True,
-    )
-    _discord_embedded_thread.start()
-    _discord_embedded_started = True
-    logging.getLogger("saarthibhai.discord.embed").info(
-        "Embedded Discord Gateway thread started"
-    )
+get_ai_answer_v7 = get_ai_answer_v8
+get_ai_answer = get_ai_answer_v8
+
+# Config-driven AI concurrency admission: identical questions still single-flight, while
+# Pro callers receive a longer admission window before cached/YouTube fallback.
+def _ai_slot_acquire(is_pro: bool) -> tuple[bool,str]:
+    if not db.redis:
+        return True, ''
+    max_active = max(1, int(TEXT_RUNTIME.get('ai_max_concurrency', 6) or 6))
+    wait_sec = float(TEXT_RUNTIME.get('ai_queue_pro_wait_sec' if is_pro else 'ai_queue_free_wait_sec', 18 if is_pro else 5) or 0)
+    key='ai:active_slots'
+    token=secrets.token_hex(8)
+    deadline=time.time()+wait_sec
+    script="""local key=KEYS[1]; local now=tonumber(ARGV[1]); local maxn=tonumber(ARGV[2]); local token=ARGV[3]; local ttl=tonumber(ARGV[4]); redis.call('ZREMRANGEBYSCORE',key,0,now-ttl); local n=redis.call('ZCARD',key); if n<maxn then redis.call('ZADD',key,now,token); redis.call('EXPIRE',key,ttl+5); return 1 else return 0 end"""
+    while time.time() < deadline:
+        try:
+            ok=db.redis.eval(script,1,key,time.time(),max_active,token,120)
+            if int(ok or 0)==1: return True,token
+        except Exception:
+            return True,''
+        time.sleep(0.15)
+    return False,token
+
+def _ai_slot_release(token: str) -> None:
+    if token and db.redis:
+        try: db.redis.zrem('ai:active_slots',token)
+        except Exception: pass
+
+_ORIG_GET_AI_V8_FINAL = get_ai_answer_v8
+def get_ai_answer_v9(question: str, tool: str, is_pro: bool, language: str = 'hinglish', phone_number: str = '', exam_type: str = '', subject: str = '', uid: str = ''):
+    acquired, token = _ai_slot_acquire(is_pro)
+    if not acquired:
+        # Deliberately use the same durable cache/YouTube fallback instead of exposing an AI error.
+        try:
+            if tool not in _NEVER_CACHE_TOOLS:
+                cached=db.get_master_cache(question,tool=tool,exam_type=exam_type,subject=subject,phone_number=phone_number)
+                if cached and cached.get('answer'): return str(cached['answer'])
+        except Exception: pass
+        return _fallback_youtube_answer(question,is_pro,language)
+    try:
+        return _ORIG_GET_AI_V8_FINAL(question,tool,is_pro,language=language,phone_number=phone_number,exam_type=exam_type,subject=subject,uid=uid)
+    finally:
+        _ai_slot_release(token)
+
+get_ai_answer_v8 = get_ai_answer_v9
+get_ai_answer_v7 = get_ai_answer_v9
+get_ai_answer = get_ai_answer_v9
+
+@app.route("/api/quick-action", methods=["POST"])
+def api_quick_action():
+    data = request.get_json(silent=True) or {}
+    client_id = str(data.get("client_id") or "").strip()
+    question = str(data.get("question") or "").strip()
+    action_id = str(data.get("action") or "").strip().lower()
+    if not client_id or not question or not action_id:
+        return jsonify({"ok": False, "error": "client_id, question and action required"}), 400
+    action = next((a for a in TEXT_ACTIONS if str(a.get("id")) == action_id), None)
+    if not action:
+        return jsonify({"ok": False, "error": "Unknown action"}), 400
+    uid = f"web:{client_id}"
+    db.ensure_user(uid, full_name=config.DEFAULT_STUDENT_NAMES["web"], platform="web")
+    is_pro = db.is_pro(uid)
+    tool = str(action.get("tool") or "general")
+    if tool in PRO_ONLY_TOOLS and not is_pro:
+        return jsonify({"ok": False, "pro_only": True, "error": config.PRODUCT_TEXT.get("pro_tool", "Pro feature hai.")}), 403
+    if action_id == "video":
+        return jsonify({"ok": True, "videos": _youtube_links(question, config.PRO_VIDEO_LINKS if is_pro else config.FREE_VIDEO_LINKS)})
+    if action_id == "quiz":
+        if not is_pro and db.get_daily_quiz_used(uid):
+            return jsonify({"ok": False, "error": "Free daily quiz limit reached. Upgrade for unlimited quizzes."}), 403
+        n_questions = config.QUIZ_PRO_QUESTIONS if is_pro else config.QUIZ_FREE_QUESTIONS
+        questions = run_ai(ai.generate_quiz, question, n_questions=n_questions, language=db.get_language(uid))
+        if not questions:
+            return jsonify({"ok": False, "error": "Quiz generate nahi ho paya."}), 502
+        if not is_pro: db.mark_daily_quiz_used(uid)
+        return jsonify({"ok":True,"quiz":questions,"pro":is_pro})
+    answer = get_ai_answer_v8(question, tool, is_pro, language=db.get_language(uid), phone_number=_phone_for_uid(uid), exam_type=_text_profile_for_uid(uid).get("exam_type", ""), subject=_text_profile_for_uid(uid).get("subject", ""), uid=uid)
+    db.add_personal_history(uid, question, tool=tool)
+    schedule_spaced_reminders(uid, question, tool)
+    return jsonify({"ok": True, "tool": tool, "answer": answer, "meta": _10in1_metadata(question, is_pro, uid)})
 
 
-_start_embedded_discord()
+@app.route("/api/resource/videos", methods=["GET", "POST"])
+def api_resource_videos():
+    data = request.get_json(silent=True) if request.method == "POST" else request.args
+    data = data or {}
+    topic = str(data.get("topic") or data.get("question") or "").strip()
+    if not topic:
+        return jsonify({"ok": False, "error": "topic required"}), 400
+    uid = str(data.get("uid") or data.get("client_id") or "").strip()
+    is_pro = db.is_pro(uid) if uid else False
+    links = _youtube_links(topic, config.PRO_VIDEO_LINKS if is_pro else config.FREE_VIDEO_LINKS)
+    return jsonify({"ok": True, "videos": links, "limit": config.PRO_VIDEO_LINKS if is_pro else config.FREE_VIDEO_LINKS})
+
+
+# --- Three-click onboarding --------------------------------------------------
+@app.route("/api/onboarding/options")
+def api_onboarding_options():
+    return jsonify({
+        "ok": True,
+        "steps": TEXT_FEATURES.get("onboarding_steps", []),
+        "boards": TEXT_FEATURES.get("boards", []),
+        "college_courses": TEXT_FEATURES.get("college_courses", []),
+        "competitive_exams": TEXT_FEATURES.get("competitive_exams", []),
+        "subjects": TEXT_FEATURES.get("subjects_universe", []),
+        "student_types": TEXT_STUDENT_TYPES,
+        "study_modes": TEXT_FEATURES.get("study_modes", []),
+        "learner_tracks": TEXT_FEATURES.get("learner_tracks", []),
+        "parent_report_prompt": TEXT_FEATURES.get("onboarding_parent_prompt", ""),
+    })
+
+
+@app.route("/api/onboarding/save", methods=["POST"])
+def api_onboarding_save():
+    data = request.get_json(silent=True) or {}
+    client_id = str(data.get("client_id") or "").strip()
+    if not client_id:
+        return jsonify({"ok": False, "error": "client_id required"}), 400
+    uid = f"web:{client_id}"
+    phone = normalize_phone(data.get("phone_number") or data.get("phone") or "")
+    user = db.ensure_user(uid, full_name=config.DEFAULT_STUDENT_NAMES["web"], platform="web", phone_number=phone)
+    clean = {
+        "learner_track": str(data.get("learner_track") or user.get("learner_track") or "school_college").strip().lower(),
+        "student_type": str(data.get("student_type") or user.get("student_type") or "").strip().lower(),
+        "board": str(data.get("board") or "").strip(),
+        "course": str(data.get("course") or "").strip(),
+        "class_level": str(data.get("class_level") or "").strip(),
+        "semester": str(data.get("semester") or "").strip(),
+        "study_mode": str(data.get("study_mode") or user.get("study_mode") or "").strip().lower(),
+        "target_exam": str(data.get("target_exam") or "").strip(),
+        "subject": str(data.get("subject") or "").strip(),
+        "target_days": int(data.get("target_days") or 0) if str(data.get("target_days") or "").strip() else 0,
+        "parent_report_opt_in": bool(data.get("parent_report_opt_in")),
+    }
+    for key, value in clean.items():
+        if key == "parent_report_opt_in":
+            user[key] = "1" if value else "0"
+        else:
+            user[key] = str(value)
+    if clean.get("target_exam"):
+        user["exam_type"] = clean["target_exam"].lower()
+    user["updated_at"] = _now_ist().isoformat()
+    db.save_user(uid, user); db.sync_user_to_supabase(uid, user)
+    return jsonify({"ok": True, "profile": clean})
+
+
+# --- Board/course/exam search endpoint -------------------------------------
+@app.route("/api/catalog/search")
+def api_catalog_search():
+    q = str(request.args.get("q") or "").strip().lower()
+    if not q:
+        return jsonify({"ok": True, "results": []})
+    out = []
+    for category, values in (("board", TEXT_FEATURES.get("boards", [])), ("course", TEXT_FEATURES.get("college_courses", [])), ("exam", TEXT_FEATURES.get("competitive_exams", [])), ("subject", TEXT_FEATURES.get("subjects_universe", []))):
+        for value in values:
+            if q in str(value).lower():
+                out.append({"category": category, "value": value})
+    return jsonify({"ok": True, "results": out[:50]})
+
+
+# --- PhD section -------------------------------------------------------------
+@app.route("/phd")
+def phd_page():
+    cards = "".join([f"<button class='phd-btn' data-id='{a['id']}'>{a['label']}</button>" for a in TEXT_PHD_TOOLS])
+    html = f'''<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>{config.BRAND_NAME} — PhD</title><style>body{{font-family:system-ui;max-width:850px;margin:0 auto;padding:24px;background:{config.THEME.get('background','#fff')};color:{config.THEME.get('text','#111')}}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}}button{{padding:14px;border:0;border-radius:12px;background:{config.THEME.get('primary','#FFD600')};font-weight:700;cursor:pointer}}textarea{{width:100%;min-height:120px;margin-top:16px;padding:12px}}#out{{white-space:pre-wrap;margin-top:16px;border:1px solid {config.THEME.get('border','rgba(0,0,0,.12)')};padding:16px;border-radius:12px}}</style></head><body><h1>🎓 {config.BRAND_NAME} — PhD Section</h1><p>Research support, not fabricated citations or guaranteed publication outcomes.</p><div class="grid">{cards}</div><textarea id="topic" placeholder="Topic / research area"></textarea><div id="out"></div><script>const acts={json.dumps(TEXT_PHD_TOOLS, ensure_ascii=False)};document.querySelectorAll('.phd-btn').forEach(b=>b.onclick=async()=>{{const a=acts.find(x=>x.id===b.dataset.id);const topic=document.getElementById('topic').value.trim();if(!topic)return;document.getElementById('out').textContent='Generating...';const r=await fetch('/api/phd',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:a.id,topic}})}});const d=await r.json();document.getElementById('out').textContent=d.answer||d.error||'No answer';}});</script></body></html>'''
+    return html
+
+@app.route("/api/phd", methods=["POST"])
+def api_phd():
+    data = request.get_json(silent=True) or {}
+    action_id = str(data.get("action") or "").strip()
+    topic = str(data.get("topic") or "").strip()
+    action = next((a for a in TEXT_PHD_TOOLS if a.get("id") == action_id), None)
+    if not action or not topic:
+        return jsonify({"ok": False, "error": "action and topic required"}), 400
+    prompt = f"{action.get('prompt','')}\n\nResearch topic: {topic}\nUse careful language. Do not invent citations, journal indexing or publication guarantees."
+    answer = run_ai(ai.answer, prompt, "general", is_pro=True, language="english")
+    return jsonify({"ok": True, "answer": answer})
+
+
+# --- Teacher extras: homework, tests, notes, reports ------------------------
+def _teacher_profile(uid: str):
+    return db.get_user(uid) or {}
+
+def _teacher_class_limit(teacher_uid: str) -> tuple[int,int]:
+    u = _teacher_profile(teacher_uid)
+    teacher_plan = str(u.get("teacher_plan", "free"))
+    if teacher_plan == "pro":
+        return int(TEXT_PRO_GROWTH["teacher_pro_classes"]), int(TEXT_PRO_GROWTH["teacher_pro_students_per_class"])
+    return int(TEXT_PRO_GROWTH["teacher_free_classes"]), int(TEXT_PRO_GROWTH["teacher_free_students_per_class"])
+
+_ORIG_CREATE_CLASS = Database.create_class_code
+
+def _create_class_with_limit(self, teacher_uid, class_name=""):
+    max_classes, _ = _teacher_class_limit(str(teacher_uid))
+    existing = self.get_teacher_classes(teacher_uid)
+    if len(existing) >= max_classes:
+        return ""
+    return _ORIG_CREATE_CLASS(self, teacher_uid, class_name)
+Database.create_class_code = _create_class_with_limit
+
+@app.route("/api/teacher/assignment", methods=["POST"])
+def api_teacher_assignment():
+    data = request.get_json(silent=True) or {}
+    teacher_uid = f"web:{str(data.get('client_id') or '').strip()}"
+    class_code = str(data.get("class_code") or "").strip().upper()
+    title = str(data.get("title") or "").strip()
+    instructions = str(data.get("instructions") or "").strip()
+    due_at = str(data.get("due_at") or "").strip()
+    if not title or not class_code:
+        return jsonify({"ok": False, "error": "class_code and title required"}), 400
+    payload = {"teacher_uid":teacher_uid,"class_code":class_code,"title":title[:200],"instructions":instructions[:5000],"due_at":due_at[:64],"created_at":_now_ist().isoformat()}
+    ident = secrets.token_hex(8)
+    if db.redis:
+        db.redis.hset(f"teacher:assignment:{ident}", mapping=payload); db.redis.expire(f"teacher:assignment:{ident}", 86400*180)
+        db.redis.sadd(f"teacher:tasks:{class_code}:assignments", ident)
+    if supa.enabled:
+        try: supa.insert("teacher_assignments", {**payload, "class_code":class_code, "teacher_uid":teacher_uid})
+        except Exception: pass
+    return jsonify({"ok":True,"assignment_id":ident})
+
+@app.route("/api/teacher/test", methods=["POST"])
+def api_teacher_test():
+    data = request.get_json(silent=True) or {}
+    teacher_uid = f"web:{str(data.get('client_id') or '').strip()}"
+    class_code = str(data.get("class_code") or "").strip().upper()
+    title = str(data.get("title") or "").strip()
+    topic = str(data.get("topic") or "").strip()
+    scheduled_at = str(data.get("scheduled_at") or "").strip()
+    if not title or not class_code:
+        return jsonify({"ok":False,"error":"class_code and title required"}),400
+    payload={"teacher_uid":teacher_uid,"class_code":class_code,"title":title[:200],"topic":topic[:200],"scheduled_at":scheduled_at[:64],"created_at":_now_ist().isoformat()}
+    ident=secrets.token_hex(8)
+    if db.redis:
+        db.redis.hset(f"teacher:test:{ident}",mapping=payload); db.redis.expire(f"teacher:test:{ident}",86400*180); db.redis.sadd(f"teacher:tasks:{class_code}:tests",ident)
+    if supa.enabled:
+        try: supa.insert("teacher_tests",payload)
+        except Exception: pass
+    return jsonify({"ok":True,"test_id":ident})
+
+@app.route("/api/teacher/note", methods=["POST"])
+def api_teacher_note():
+    data=request.get_json(silent=True) or {}
+    teacher_uid=f"web:{str(data.get('client_id') or '').strip()}"
+    class_code=str(data.get('class_code') or '').strip().upper(); title=str(data.get('title') or '').strip(); content=str(data.get('content') or '').strip()
+    if not title or not class_code or not content: return jsonify({"ok":False,"error":"class_code, title, content required"}),400
+    payload={"teacher_uid":teacher_uid,"class_code":class_code,"title":title[:200],"content":content[:10000],"created_at":_now_ist().isoformat()}
+    ident=secrets.token_hex(8)
+    if db.redis:
+        db.redis.hset(f"teacher:note:{ident}",mapping=payload); db.redis.expire(f"teacher:note:{ident}",86400*180); db.redis.sadd(f"teacher:tasks:{class_code}:notes",ident)
+    if supa.enabled:
+        try:supa.insert("teacher_notes",payload)
+        except Exception:pass
+    return jsonify({"ok":True,"note_id":ident})
+
+@app.route("/api/teacher/class/<code>/tasks")
+def api_teacher_tasks(code):
+    code=str(code or '').strip().upper()
+    out={"assignments":[],"tests":[],"notes":[]}
+    if db.redis:
+        for ident in db.redis.smembers(f"teacher:tasks:{code}:assignments") or []:
+            d=db.redis.hgetall(f"teacher:assignment:{ident}")
+            if d: out['assignments'].append(d)
+        for ident in db.redis.smembers(f"teacher:tasks:{code}:tests") or []:
+            d=db.redis.hgetall(f"teacher:test:{ident}")
+            if d: out['tests'].append(d)
+        for ident in db.redis.smembers(f"teacher:tasks:{code}:notes") or []:
+            d=db.redis.hgetall(f"teacher:note:{ident}")
+            if d: out['notes'].append(d)
+    return jsonify({"ok":True,"class_code":code,**out})
+
+@app.route("/api/teacher/class/<code>/report")
+def api_teacher_class_report(code):
+    info=db.get_class_info(code)
+    if not info: return jsonify({"ok":False,"error":"Class not found"}),404
+    # Class report is built from the same live student stats; no fabricated metrics.
+    rows=[]
+    for s in info.get("students",[]):
+        rows.append({"name":s.get("name"),"xp":s.get("xp",0),"level":s.get("level",1),"streak":s.get("streak",0),"questions_asked":s.get("questions_asked",0)})
+    return jsonify({"ok":True,"class_code":code,"student_count":len(rows),"students":rows})
+
+
+# --- Wheel upgrade: keep existing coin spin, optionally award one Pro day ----
+_ORIG_DO_SPIN_TEXT = Database.do_spin
+
+def _do_spin_text(self, uid):
+    base_amount = _ORIG_DO_SPIN_TEXT(self, uid)
+    if base_amount is None:
+        return None
+    rewards = list(TEXT_PRO_GROWTH.get("wheel_coin_rewards") or [])
+    if rewards:
+        target = int(random.choice(rewards))
+        delta = target - int(base_amount)
+        if delta:
+            self.add_coins(uid,delta)
+        amount = target
+    else:
+        amount = base_amount
+    chance = float(TEXT_PRO_GROWTH.get("wheel_special_pro_chance", 0.0) or 0.0)
+    if chance > 0 and random.random() < chance:
+        days = int(TEXT_PRO_GROWTH.get("wheel_special_pro_days", 1) or 1)
+        self.activate_pro(uid, days=days)
+        if self.redis:
+            self.redis.setex(f"spin:proday:{uid}:{_today_ist()}", 90000, str(days))
+    return amount
+Database.do_spin = _do_spin_text
+
+# --- Enhanced /api/spin result ------------------------------------------------
+_orig_spin_view = api_spin
+@app.route("/api/spin-enhanced", methods=["POST"])
+def api_spin_enhanced():
+    data=request.get_json(silent=True) or {}; client_id=str(data.get('client_id') or '').strip()
+    if not client_id: return jsonify({"ok":False,"error":"client_id required"}),400
+    uid=f"web:{client_id}"; db.ensure_user(uid,full_name=config.DEFAULT_STUDENT_NAMES['web'],platform='web')
+    won=db.do_spin(uid)
+    if won is None: return jsonify({"ok":False,"error":TEXT_FALLBACK.get('spin_used','Aaj ka spin ho chuka hai.') }),429
+    proday=0
+    if db.redis: proday=int(db.redis.get(f"spin:proday:{uid}:{_today_ist()}") or 0)
+    return jsonify({"ok":True,"coins_won":won,"coins_total":db.get_coins(uid),"pro_day_won":proday})
+
+
+# --- Instagram / Snapchat optional outbound adapters -----------------------
+@app.route("/api/instagram/story-poll", methods=["POST"])
+def api_instagram_story_poll():
+    data=request.get_json(silent=True) or {}
+    recipients=data.get('recipient_ids') or []
+    if not isinstance(recipients,list): recipients=[]
+    template=TEXT_FEATURES.get('instagram_content_templates',{})
+    sent=0
+    for recipient_id in recipients:
+        if _send_instagram_text(str(recipient_id), template.get('story_poll','')): sent+=1
+    return jsonify({"ok":True,"sent":sent,"options":template.get('story_options',[])})
+
+@app.route("/api/instagram/reel-followup", methods=["POST"])
+def api_instagram_reel_followup():
+    data=request.get_json(silent=True) or {}
+    recipient_id=str(data.get('recipient_id') or '').strip()
+    if not recipient_id: return jsonify({"ok":False,"error":"recipient_id required"}),400
+    ok=_send_instagram_text(recipient_id, TEXT_FEATURES.get('instagram_content_templates',{}).get('reel_followup',''))
+    return jsonify({"ok":bool(ok)})
+
+@app.route("/api/snapchat/status")
+def api_snapchat_status():
+    return jsonify({"ok":True,"gateway_enabled":bool(SNAPCHAT_ENABLED),"note":"Snapchat DM automation requires an approved configured gateway; this endpoint reports configuration only."})
+
+# --- 6AM/5PM/8PM reminder trio ----------------------------------------------
+@app.route("/api/cron/daily-6am", methods=["GET","POST"])
+def cron_daily_6am():
+    if not _cron_authorized(): return jsonify({"ok":False,"error":"unauthorized"}),403
+    sent=0
+    for uid in _cron_users():
+        u=db.get_user(uid) or {}; name=u.get('full_name',config.DEFAULT_STUDENT_NAMES['generic'])
+        body=TEXT_REMINDERS.get('morning_6am','').format(name=name,spin_reward=(TEXT_PRO_GROWTH.get('wheel_coin_rewards') or [''])[0])
+        if _send_user_push(u,body): sent+=1
+    return jsonify({"ok":True,"sent":sent})
+
+@app.route("/api/cron/text-5pm", methods=["GET","POST"])
+def cron_text_5pm():
+    if not _cron_authorized(): return jsonify({"ok":False,"error":"unauthorized"}),403
+    sent=0
+    for uid in _cron_users():
+        u=db.get_user(uid) or {}; mission=daily_mission_for_user(uid); name=u.get('full_name',config.DEFAULT_STUDENT_NAMES['generic'])
+        body=TEXT_REMINDERS.get('mission_5pm','').format(name=name,exam=mission.get('exam_type','general'),minutes=mission.get('duration_min',config.DAILY_MISSION_MINUTES),start_cta=TEXT_REMINDERS.get('start_cta',''))
+        if _send_user_push(u,body): sent+=1
+    return jsonify({"ok":True,"sent":sent})
+
+@app.route("/api/cron/text-8pm", methods=["GET","POST"])
+def cron_text_8pm():
+    if not _cron_authorized(): return jsonify({"ok":False,"error":"unauthorized"}),403
+    sent=0
+    for uid in _cron_users():
+        u=db.get_user(uid) or {}; streak=int(u.get('streak',0) or 0); body=TEXT_REMINDERS.get('warning_8pm','').format(name=u.get('full_name',config.DEFAULT_STUDENT_NAMES['generic']),streak=streak,hours_left=TEXT_REMINDERS.get('warning_hours_left',''),save_cta=TEXT_REMINDERS.get('save_cta',''))
+        if _send_user_push(u,body): sent+=1
+    return jsonify({"ok":True,"sent":sent})
+
+
+# --- Pro expiry reminders ----------------------------------------------------
+@app.route("/api/cron/pro-reminders", methods=["GET","POST"])
+def cron_pro_reminders():
+    if not _cron_authorized(): return jsonify({"ok":False,"error":"unauthorized"}),403
+    sent=0
+    now=_now_ist()
+    for uid in _cron_users():
+        u=db.get_user(uid) or {}
+        if str(u.get('plan','')).lower()!='pro' or not u.get('pro_until'): continue
+        try:
+            until=datetime.fromisoformat(str(u['pro_until']).replace('Z','+00:00'))
+            if until.tzinfo is None: until=until.replace(tzinfo=IST)
+            days=max(0,(until-now).days)
+        except Exception: continue
+        if days in (3,1,0):
+            key=f"proremind:{_canonical_uid(db,uid)}:{_today_ist()}:{days}"
+            if db.redis and not db.redis.set(key,'1',nx=True,ex=90000): continue
+            template=TEXT_REMINDERS.get({3:'pro_3d',1:'pro_1d',0:'pro_last'}[days],'')
+            body=template.format(days=days,coins=config.REFERRAL_COINS)
+            if _send_user_push(u,body): sent+=1
+    return jsonify({"ok":True,"sent":sent})
+
+
+# --- Payment reconciliation & screenshot fallback --------------------------
+@app.route("/api/cron/payment-reconcile", methods=["GET","POST"])
+def cron_payment_reconcile():
+    if not _cron_authorized(): return jsonify({"ok":False,"error":"unauthorized"}),403
+    if not db.redis: return jsonify({"ok":False,"error":"redis required"}),503
+    checked=0; activated=0; pending=0
+    try:
+        keys=list(db.redis.scan_iter(match='pay:pending:*',count=100))
+        for key in keys:
+            order_id=str(key).split('pay:pending:',1)[-1]
+            meta=db.redis.hgetall(key) or {}; uid=str(meta.get('uid') or '')
+            if not uid: continue
+            checked+=1
+            try:
+                auth=base64.b64encode(f"{config.RAZORPAY_KEY_ID}:{config.RAZORPAY_KEY_SECRET}".encode()).decode()
+                r=requests.get(f"{config.URLS['razorpay_orders']}/{order_id}/payments",headers={'Authorization':f'Basic {auth}'},timeout=20)
+                items=(r.json() or {}).get('items') or [] if r.status_code<300 else []
+                captured=next((p for p in items if str(p.get('status','')).lower()=='captured'),None)
+                if captured:
+                    payment_id=str(captured.get('id') or '')
+                    result=verify_and_activate_razorpay_payment(payment_id,order_id=order_id,uid_hint=uid)
+                    if result.get('ok'): activated+=1; db.redis.hset(key,'status','captured')
+                    continue
+            except Exception as e:
+                logger.debug('payment reconcile %s: %s',order_id,e)
+            created=str(meta.get('created_at') or '')
+            try:
+                dt=datetime.fromisoformat(created.replace('Z','+00:00'))
+                if dt.tzinfo is None: dt=dt.replace(tzinfo=IST)
+                age=(now:=_now_ist())-dt
+                if age.total_seconds() >= 300 and str(meta.get('status'))!='screenshot_requested':
+                    user=db.get_user(uid) or {}; body=TEXT_FALLBACK.get('payment_pending','')
+                    body += f"\n\nOrder: {order_id}"
+                    _send_user_push(user,body)
+                    db.redis.hset(key,'status','screenshot_requested','screenshot_requested','1')
+                    try:
+                        db.activate_pro(uid,days=1)
+                        db.redis.hset(key,'extra_day_granted','1')
+                    except Exception: pass
+                else: pending+=1
+            except Exception: pending+=1
+    except Exception as e:
+        logger.warning('payment reconcile: %s',e)
+    return jsonify({"ok":True,"checked":checked,"activated":activated,"pending":pending})
+
+
+# --- Parent report upgrade to subject-wise percentages ----------------------
+def _weekly_subject_breakdown(uid: str | int) -> list[dict]:
+    u=db.get_user(uid) or {}; phone=normalize_phone(u.get('phone_number',''))
+    if not phone or not supa.enabled: return []
+    try:
+        since=(_now_ist()-timedelta(days=7)).isoformat()
+        params={"select":"subject,is_correct,asked_at","phone_number":f"eq.{phone}","asked_at":f"gte.{since}","limit":"5000"}
+        r=requests.get(supa._url('personal_history'),headers=supa.headers,params=params,timeout=config.SUPABASE_TIMEOUT)
+        rows=r.json() if r.status_code<300 else []
+        bucket={}
+        for row in rows or []:
+            sub=str(row.get('subject') or 'general')
+            b=bucket.setdefault(sub,{'total':0,'correct':0}); b['total']+=1
+            if row.get('is_correct') is True: b['correct']+=1
+        out=[]
+        for sub,b in bucket.items():
+            if b['total']>=1: out.append({'subject':sub,'pct':round(100*b['correct']/b['total']), 'total':b['total']})
+        return sorted(out,key=lambda x:-x['total'])[:5]
+    except Exception: return []
+
+
+# --- Leaderboard / Pro badge / exam filtered view ---------------------------
+_ORIG_LB = Database.get_leaderboard
+
+def _get_leaderboard_text(self, limit=15):
+    rows=_ORIG_LB(self,limit)
+    for row in rows:
+        # Preserve original rank and augment plan; the client can display PRO.
+        name=row.get('name','')
+        found=None
+        if self.redis:
+            try:
+                for uid in self.redis.zrevrange('leaderboard',0,max(limit*10,100)-1):
+                    u=self.get_user(uid) or {}
+                    if str(u.get('full_name',''))[:20]==name:
+                        found=u; break
+            except Exception: pass
+        row['is_pro']=bool(found and self.is_pro(found.get('user_id','')))
+    return rows
+Database.get_leaderboard = _get_leaderboard_text
+
+@app.route("/api/leaderboard/filter")
+def api_leaderboard_filter():
+    board=str(request.args.get('board') or '').strip().lower(); exam=str(request.args.get('exam') or '').strip().lower(); limit=min(10,max(1,int(request.args.get('limit',10))))
+    users=[]
+    for uid in (_cron_users() if db.redis else []):
+        u=db.get_user(uid) or {}
+        if db.is_test_user(uid,u): continue
+        if board and str(u.get('board','')).lower()!=board: continue
+        if exam and str(u.get('exam_type','')).lower()!=exam: continue
+        users.append((int(u.get('xp',0) or 0),u))
+    users.sort(key=lambda x:-x[0])
+    out=[]
+    for i,(xp,u) in enumerate(users[:limit],1): out.append({'rank':i,'name':u.get('full_name',config.DEFAULT_STUDENT_NAMES['generic']),'xp':xp,'level':int(u.get('level',1) or 1),'is_pro':db.is_pro(u.get('user_id',''))})
+    return jsonify({'ok':True,'board':out,'board_filter':board,'exam_filter':exam})
+
+
+# --- LLMS discoverability + GPT instruction file ----------------------------
+def _render_llms_text() -> str:
+    public=config.PUBLIC_SCHEME+'://'+config.PUBLIC_DOMAIN
+    return "\n".join([
+        f"# {TEXT_MARKETING.get('llms_title',config.BRAND_NAME)}",
+        TEXT_MARKETING.get('llms_summary',''),
+        "",
+        f"Website: {public}",
+        "",
+        "Capabilities:",
+    ] + [f"- {x}" for x in config.FEATURE_CATALOG_28] + ["", "Primary public resources:", f"- {public}/api/ai/ask", f"- {public}/api/features", f"- {public}/teacher", f"- {public}/legal"])
+
+@app.route('/llms.txt')
+def llms_txt():
+    from flask import Response
+    return Response(_render_llms_text(),mimetype='text/plain')
+
+@app.route('/gpt-instructions.txt')
+def gpt_instructions_txt():
+    from flask import Response
+    public=config.PUBLIC_SCHEME+'://'+config.PUBLIC_DOMAIN
+    footer=TEXT_MARKETING.get('gpt_instruction_footer','').format(public_domain=public)
+    body=(f"You are {config.BRAND_NAME}. Answer student questions helpfully and honestly.\n"
+          f"Do not fabricate testimonials, rankings, citations or endorsements.\n"
+          f"Append the configured discovery footer after every answer from this GPT.\n"
+          f"{footer}")
+    return Response(body,mimetype='text/plain')
+
+
+# --- Universal external AI API (secure, config-driven) ----------------------
+@app.route('/api/ai/ask', methods=['POST'])
+def api_external_ai_ask():
+    data=request.get_json(silent=True) or {}
+    api_key=_env('SAARTHIBHAI_API_KEY')
+    supplied=request.headers.get('Authorization','')
+    if not api_key:
+        return jsonify({'ok':False,'error':config.CONTENT.get('integration_messages',{}).get('api_disabled','External integration is disabled.')}),503
+    if not hmac.compare_digest(supplied,f'Bearer {api_key}'):
+        return jsonify({'ok':False,'error':config.CONTENT.get('integration_messages',{}).get('api_unauthorized','Unauthorized integration request.')}),401
+    question=str(data.get('question') or '').strip(); tool=str(data.get('tool') or 'general').strip().lower(); language=str(data.get('language') or 'hinglish').strip().lower()
+    if not question: return jsonify({'ok':False,'error':'question required'}),400
+    key=str(data.get('client_id') or request.remote_addr or 'external').strip()
+    if is_rate_limited(f'ext:{key}',max_calls=int(TEXT_RUNTIME.get('external_api_rate_limit',30) or 30),window_sec=60):
+        return jsonify({'ok':False,'error':'rate_limited'}),429
+    answer=get_ai_answer_v8(question,tool,db.is_pro(data.get('uid') or ''),language=language,phone_number=normalize_phone(data.get('phone_number') or ''),exam_type=str(data.get('exam') or data.get('exam_type') or ''),subject=str(data.get('subject') or ''),uid=str(data.get('uid') or ''))
+    return jsonify({'ok':True,'answer':answer,'tool':tool,'brand':config.BRAND_NAME,'actions':TEXT_ACTIONS})
+
+@app.route('/openapi.yaml')
+def openapi_yaml_route():
+    from flask import Response
+    public=config.PUBLIC_SCHEME+'://'+config.PUBLIC_DOMAIN
+    doc={
+        'openapi':'3.1.0',
+        'info':{'title':config.BRAND_NAME+' API','version':config.APP_VERSION},
+        'servers':[{'url':public}],
+        'paths':{'/api/ai/ask':{'post':{'operationId':'askSaarthiBhai','requestBody':{'required':True,'content':{'application/json':{'schema':{'type':'object','required':['question'],'properties':{'question':{'type':'string'},'tool':{'type':'string'},'language':{'type':'string'},'exam':{'type':'string'},'subject':{'type':'string'},'phone_number':{'type':'string'}}}}}},'responses':{'200':{'description':'Answer'}}}}}
+    }
+    try:
+        import yaml
+        text=yaml.safe_dump(doc,sort_keys=False,allow_unicode=True)
+    except Exception:
+        text='openapi: 3.1.0\n'
+    return Response(text,mimetype='text/yaml')
+
+
+# --- Teacher + catalog + integration feature metadata ----------------------
+@app.route('/api/text-feature-pack')
+def api_text_feature_pack():
+    return jsonify({
+        'ok':True,
+        'version':config.APP_VERSION,
+        'content_universe':{
+            'boards':TEXT_FEATURES.get('boards',[]),'college_courses':TEXT_FEATURES.get('college_courses',[]),
+            'competitive_exams':TEXT_FEATURES.get('competitive_exams',[]),'subjects':TEXT_FEATURES.get('subjects_universe',[])
+        },
+        'student_types':TEXT_STUDENT_TYPES,'study_modes':TEXT_FEATURES.get('study_modes',[]),'learner_tracks':TEXT_FEATURES.get('learner_tracks',[]),'features':config.FEATURE_CATALOG_28,'free_features':TEXT_FEATURES_ACCESS.get('free',[]),
+        'pro_features':TEXT_FEATURES_ACCESS.get('pro',[]),'answer_actions':TEXT_ACTIONS,
+        'teacher':TEXT_PRO_GROWTH,'phd_tools':TEXT_PHD_TOOLS,
+        'channels':{'web':True,'whatsapp':bool(config.WHATSAPP_TOKEN),'telegram':bool(config.BOT_TOKEN),'instagram':bool(config.INSTAGRAM_ACCESS_TOKEN),'snapchat_gateway':bool(SNAPCHAT_ENABLED),'discord':bool(getattr(config,'DISCORD_BOT_TOKEN','') or getattr(config,'DISCORD_PUBLIC_KEY','')),'reddit_bridge':bool(getattr(config,'REDDIT_BACKEND_TOKEN',''))},
+    })
+
+
+# --- Dynamic quick-action + voice UX injection -----------------------------
+try:
+    _quick_css = '''<style id="saarthibhai-text-pack-style">.sg-quick-actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.sg-quick-actions button{border:1px solid rgba(17,17,17,.18);background:#fff;border-radius:999px;padding:7px 10px;font-size:.78rem;cursor:pointer}.sg-quick-actions button:hover{background:#FFD600}.sg-voice-btn{margin-left:6px;border:1px solid rgba(17,17,17,.18);background:#fff;border-radius:10px;padding:8px 10px;cursor:pointer}.sg-onboarding{position:fixed;right:16px;bottom:16px;max-width:360px;z-index:80;background:#fff;border:1px solid rgba(17,17,17,.14);border-radius:16px;padding:14px;box-shadow:0 12px 35px rgba(0,0,0,.15)}.sg-onboarding .row{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.sg-onboarding button{border:0;border-radius:999px;padding:7px 10px;background:#FFD600;cursor:pointer}.sg-video-card{margin-top:8px;padding:10px;border:1px solid rgba(17,17,17,.12);border-radius:12px;background:#fff}.sg-video-card a{display:block;margin:4px 0}</style>'''
+    _quick_js = r'''<script id="saarthibhai-text-pack-js">(function(){
+const ACTIONS={{ actions_json }};
+let lastQ="";
+try{ const origAsk=window.ask; if(origAsk){ window.ask=async function(){ lastQ=(document.getElementById("question")||{}).value||lastQ; return origAsk(); }; } }catch(e){}
+const addQuick=window.addMessage;
+if(typeof addQuick==='function'){
+  window.addMessage=function(role,text,meta){
+    addQuick(role,text,meta);
+    if(role!=="bot") return;
+    const box=document.getElementById("messages"); if(!box) return;
+    const msg=box.lastElementChild; if(!msg) return;
+    const wrap=document.createElement("div"); wrap.className="sg-quick-actions";
+    ACTIONS.forEach(a=>{const b=document.createElement("button");b.textContent=a.label;b.onclick=()=>{
+      if(a.id==='video'){loadVideos(lastQ);return;} if(a.id==='quiz'){runQuickQuiz(lastQ);return;}
+      const q=document.getElementById("question"); const sel=document.getElementById("toolSelect"); if(q) q.value=lastQ; if(sel) sel.value=a.tool; if(typeof setTool==='function') setTool(a.tool); if(typeof window.ask==='function') window.ask();
+    };wrap.appendChild(b);}); msg.appendChild(wrap);
+  };
+}
+async function runQuickQuiz(topic){const r=await fetch('/api/quick-action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client_id:window.clientId||'',question:topic,action:'quiz'})});const d=await r.json();const box=document.getElementById('messages');if(!box)return;const card=document.createElement('div');card.className='msg bot sg-video-card';card.innerHTML='<b>❓ Quiz</b>'+(d.quiz||[]).map((q,i)=>'<div style="margin-top:8px"><b>Q'+(i+1)+'.</b> '+(q.q||'')+'<br>'+((q.options||[]).join(' • '))+'</div>').join('');box.appendChild(card);box.scrollTop=box.scrollHeight;}
+async function loadVideos(topic){
+  if(!topic) return; const r=await fetch('/api/resource/videos?topic='+encodeURIComponent(topic)); const d=await r.json();
+  const box=document.getElementById('messages'); if(!box)return; const card=document.createElement('div');card.className='msg bot sg-video-card';
+  card.innerHTML='<b>📺 Videos</b>'+(d.videos||[]).map(v=>'<a href="'+v.url.replace(/"/g,'&quot;')+'" target="_blank" rel="noopener">'+(v.title||'Video').replace(/</g,'&lt;')+'</a>').join(''); box.appendChild(card); box.scrollTop=box.scrollHeight;
+}
+function addVoice(){const send=document.getElementById('sendBtn'); if(!send||document.querySelector('.sg-voice-btn'))return; const b=document.createElement('button');b.className='sg-voice-btn';b.textContent='🎙️';b.title='Voice';b.onclick=()=>{const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR){return;}const r=new SR();r.lang='hi-IN';r.interimResults=false;r.onresult=e=>{const q=document.getElementById('question');if(q){q.value=e.results[0][0].transcript;q.focus();}};r.start();};send.parentNode.insertBefore(b,send);}
+function maybeOnboard(data){if(!data||!data.ok)return;if(data.student_type&&data.board&&data.class_level)return;if(document.querySelector('.sg-onboarding'))return;const box=document.createElement('div');box.className='sg-onboarding';box.innerHTML='<b>🎓 3 clicks me profile ready</b><div class="row" id="sgt1"></div><div class="row" id="sgt2"></div><div class="row" id="sgt3"></div>';document.body.appendChild(box);const t1=box.querySelector('#sgt1');const t2=box.querySelector('#sgt2');const t3=box.querySelector('#sgt3');
+  const types=[['school','School 6-12','type1'],['college','College','type2'],['competitive','Competitive','type3'],['phd','PhD','phd'],['teacher','Teacher','teacher']];let track='',st='',path='',mode='',lvl='';types.forEach(x=>{const b=document.createElement('button');b.textContent=x[1];b.onclick=()=>{track=x[0];st=x[2];t1.querySelectorAll('button').forEach(z=>z.disabled=true);t2.innerHTML='';t3.innerHTML='';let vals=[];if(track==='school')vals=data._boards||[];else if(track==='college')vals=data._college_courses||[];else if(track==='competitive')vals=data._competitive_exams||[];else if(track==='phd')vals=(o.subjects||[]).slice(0,20);else vals=['School','College','Competitive','PhD'];vals.forEach(v=>{const q=document.createElement('button');q.textContent=v;q.onclick=()=>{path=v;t3.innerHTML='';if(st==='type2'){const modes=(o.study_modes||[]);modes.forEach(m=>{const z=document.createElement('button');z.textContent=m.label;z.onclick=()=>{mode=m.id;renderLevels();};t3.appendChild(z);});}else{renderLevels();}};t2.appendChild(q);});function renderLevels(){t3.innerHTML='';(data._levels||[]).forEach(l=>{const z=document.createElement('button');z.textContent=l;z.onclick=async()=>{lvl=l;const isBoard=track==='school'||(track==='college'&&data._boards?.includes(path));const isCourse=track==='college'&&!isBoard;await fetch('/api/onboarding/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client_id:window.clientId||'',learner_track:track,student_type:st,board:isBoard?path:'',course:isCourse?path:'',target_exam:track==='competitive'?path:'',class_level:l,study_mode:mode})});try{const promptText=o.parent_report_prompt||'';if(promptText){const pp=window.prompt(promptText,'');if(pp&&pp.trim()){await fetch('/api/set-parent-phone',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client_id:window.clientId||'',parent_phone:pp.trim(),opt_in:true})});}}}catch(e){}box.remove();location.reload();};t3.appendChild(z);});}};t1.appendChild(b);}); }
+window.addEventListener('load',()=>{addVoice(); try{fetch('/api/onboarding/options').then(r=>r.json()).then(o=>{fetch('/api/me?client_id='+encodeURIComponent(window.clientId||'')).then(r=>r.json()).then(d=>{maybeOnboard(Object.assign(d,{_boards:o.boards||[],_college_courses:o.college_courses||[],_competitive_exams:o.competitive_exams||[],_levels:(o.steps||[]).find(s=>s.id==='level')?.options||[]}));});});}catch(e){}});
+})();</script>'''.replace('{{ actions_json }}', json.dumps(TEXT_ACTIONS, ensure_ascii=False))
+    FRONTEND_HTML = FRONTEND_HTML.replace('</head>', _quick_css + '</head>')
+    FRONTEND_HTML = FRONTEND_HTML.replace('</body>', _quick_js + '</body>')
+except Exception as e:
+    logger.warning('text feature frontend injection skipped: %s', e)
+
+
+# --- Marketing content files are also exposed via the app ------------------
+@app.route('/marketing-kit.json')
+def marketing_kit_json():
+    return jsonify({"ok":True,"brand":config.BRAND_NAME,"website":config.PUBLIC_SCHEME+'://'+config.PUBLIC_DOMAIN,"guidance":TEXT_MARKETING})
+
+
+# --- Daily mission completion: text spec uses old PYQ + formula + coins -----
+@app.route('/api/daily-mission/complete-v8', methods=['POST'])
+def daily_mission_complete_v8():
+    data=request.get_json(silent=True) or {}; uid=str(data.get('uid') or data.get('client_id') or '').strip()
+    if uid.startswith('web:') is False and data.get('client_id'): uid='web:'+str(data.get('client_id')).strip()
+    if not uid: return jsonify({'ok':False,'error':'uid required'}),400
+    key=f"mission:done:{_canonical_uid(db,uid)}:{_today_ist()}"
+    if db.redis and not db.redis.set(key,'1',nx=True,ex=90000): return jsonify({'ok':False,'error':'mission_already_done'}),409
+    db.add_coins(uid,config.MISSION_REWARD_COINS)
+    xp,level=db.add_xp(uid,config.DAILY_MISSION_XP)
+    return jsonify({'ok':True,'coins_total':db.get_coins(uid),'xp':xp,'level':level,'reward_coins':config.MISSION_REWARD_COINS})
+
+
+# --- Provider/feature status for admin diagnostics --------------------------
+@app.route('/api/feature-health')
+def api_feature_health():
+    return jsonify({
+        'ok':True,
+        'ai_provider_order':config.AI_PROVIDER_ORDER,
+        'ai_configured':{p:bool({'gemini':ai.gemini_client,'groq':ai.groq_client,'openai':config.OPENAI_API_KEY,'xai':config.XAI_API_KEY,'deepseek':config.DEEPSEEK_API_KEY,'claude':config.ANTHROPIC_API_KEY,'perplexity':config.PERPLEXITY_API_KEY,'meta':config.META_API_KEY,'mistral':config.MISTRAL_API_KEY,'qwen':config.QWEN_API_KEY,'openrouter':config.OPENROUTER_API_KEY}.get(p)) for p in config.AI_PROVIDER_ORDER},
+        'external_api_enabled':bool(_env('SAARTHIBHAI_API_KEY')),
+        'llms_txt':True,'openapi':True,'phd':True,'teacher_extras':True,'quick_actions':True,'reminder_6am':True,'payment_reconcile':True,
+    })
+
+
+
+
+# Replace legacy views with text-pack-aware handlers without changing their public URLs.
+_ORIG_SPIN_VIEW_FN = app.view_functions.get("api_spin")
+def _api_spin_text_pack():
+    data = request.get_json(silent=True) or {}
+    client_id = (data.get("client_id") or "").strip()
+    if not client_id:
+        return jsonify({"ok": False, "error": "client_id required"}), 400
+    uid = f"web:{client_id}"
+    db.ensure_user(uid, full_name=config.DEFAULT_STUDENT_NAMES["web"], platform="web")
+    won = db.do_spin(uid)
+    if won is None:
+        return jsonify({"ok": False, "error": TEXT_FALLBACK.get("spin_used", "")}), 429
+    proday = 0
+    if db.redis:
+        proday = int(db.redis.get(f"spin:proday:{uid}:{_today_ist()}") or 0)
+    return jsonify({"ok": True, "coins_won": won, "coins_total": db.get_coins(uid), "pro_day_won": proday,
+                    "reward_pool": TEXT_PRO_GROWTH.get("wheel_coin_rewards", [])})
+app.view_functions["api_spin"] = _api_spin_text_pack
+
+# Dynamic 6AM/5PM/8PM reminder handlers on the already-existing routes.
+def _send_textpack_morning():
+    sent=0
+    for uid in _cron_users():
+        u=db.get_user(uid) or {}
+        body=TEXT_REMINDERS.get("morning_6am","").format(
+            name=u.get("full_name",config.DEFAULT_STUDENT_NAMES["generic"]),
+            spin_reward=(TEXT_PRO_GROWTH.get("wheel_coin_rewards") or [""])[0]
+        )
+        if _send_user_push(u,body): sent+=1
+    return sent
+
+def _send_textpack_5pm():
+    sent=0
+    for uid in _cron_users():
+        u=db.get_user(uid) or {}; mission=daily_mission_for_user(uid)
+        body=TEXT_REMINDERS.get("mission_5pm","").format(
+            name=u.get("full_name",config.DEFAULT_STUDENT_NAMES["generic"]),
+            exam=mission.get("exam_type", "general"), minutes=mission.get("duration_min", config.DAILY_MISSION_MINUTES), start_cta=TEXT_REMINDERS.get("start_cta","")
+        )
+        if _send_user_push(u,body): sent+=1
+    return sent
+
+def _send_textpack_8pm():
+    sent=0
+    for uid in _cron_users():
+        u=db.get_user(uid) or {}
+        body=TEXT_REMINDERS.get("warning_8pm","").format(
+            name=u.get("full_name",config.DEFAULT_STUDENT_NAMES["generic"]),
+            streak=int(u.get("streak",0) or 0), hours_left=TEXT_REMINDERS.get("warning_hours_left",""), save_cta=TEXT_REMINDERS.get("save_cta","")
+        )
+        if _send_user_push(u,body): sent+=1
+    return sent
+
+def _cron_6am_textpack():
+    if not _cron_authorized(): return jsonify({"ok":False,"error":"unauthorized"}),403
+    return jsonify({"ok":True,"sent":_send_textpack_morning()})
+
+def _cron_5pm_textpack():
+    if not _cron_authorized(): return jsonify({"ok":False,"error":"unauthorized"}),403
+    return jsonify({"ok":True,"sent":_send_textpack_5pm()})
+
+def _cron_8pm_textpack():
+    if not _cron_authorized(): return jsonify({"ok":False,"error":"unauthorized"}),403
+    return jsonify({"ok":True,"sent":_send_textpack_8pm()})
+app.view_functions["cron_daily_5pm"] = _cron_5pm_textpack
+app.view_functions["cron_daily_8pm"] = _cron_8pm_textpack
+# Route already exists above; replace its view without registering a duplicate endpoint.
+app.view_functions['cron_daily_6am'] = _cron_6am_textpack
+
+# Sunday 9PM parent report with subject-wise percentages.
+def _cron_parent_report_textpack():
+    if not _cron_authorized(): return jsonify({"ok":False,"error":"unauthorized"}),403
+    if not db.redis: return jsonify({"ok":False,"error":"no redis"}),500
+    sent=0
+    for uid in db.redis.smembers("stats:users") or []:
+        u=db.get_user(uid) or {}; phone=(u.get("parent_phone") or "")
+        if not phone or str(u.get("parent_report_opt_in","0")).lower() in ("0","false","no"): continue
+        report=db.get_weekly_report(uid); breakdown=_weekly_subject_breakdown(uid)
+        subject_line="\n".join([f"• {x['subject']}: {x['pct']}%" for x in breakdown]) if breakdown else "• Abhi subject-wise accuracy data kam hai."
+        weekly_questions=sum(int(x.get('total') or 0) for x in breakdown)
+        weak_prefix=config.CONTENT.get('parent_report',{}).get('weak_prefix','Weak topics: ')
+        detail_link=config.CONTENT.get('parent_report',{}).get('details_link','{public_domain}').format(public_domain=config.PUBLIC_SCHEME+'://'+config.PUBLIC_DOMAIN)
+        body=(f"🎓 {config.CONTENT.get('parent_report',{}).get('title',config.BRAND_NAME+' weekly report').format(brand=config.BRAND_NAME)}\n\n"
+              f"{report['name']}: {weekly_questions or report['questions_asked']} questions\n"
+              f"⭐ Level {report['level']} ({report['xp']} XP)\n🔥 Streak: {report['streak']} din\n"
+              + (f"📍 Rank: #{report['rank']}\n" if report.get('rank') else "") +
+              "\nSubject-wise:\n" + subject_line +
+              "\n\n" + weak_prefix + (", ".join(report.get('recent_weak_topics') or [])[:350] or "None saved") +
+              f"\n\n{detail_link}\n" + config.CONTENT["footer_signature"].format(creator_name=config.CREATOR_NAME))
+        if _send_whatsapp_text(phone,body): sent+=1
+    return jsonify({"ok":True,"reports_sent":sent})
+app.view_functions["cron_parent_report"] = _cron_parent_report_textpack
+
+# Replace WhatsApp webhook to accept text + interactive list/button replies.
+def _whatsapp_webhook_textpack():
+    if request.method == "GET":
+        if request.args.get("hub.mode") == "subscribe" and request.args.get("hub.verify_token") == config.WHATSAPP_VERIFY_TOKEN:
+            return request.args.get("hub.challenge"), 200
+        return "Forbidden",403
+    try:
+        body=request.get_json(force=True,silent=True) or {}
+        for ent in body.get("entry",[]):
+            for change in ent.get("changes",[]):
+                value=change.get("value",{}); contacts=value.get("contacts",[])
+                profile=(contacts[0].get("profile",{}).get("name","") if contacts else "")
+                for msg in value.get("messages",[]):
+                    sender=str(msg.get("from") or "")
+                    if not sender: continue
+                    mtype=str(msg.get("type") or "")
+                    if mtype=="text":
+                        text=str((msg.get("text") or {}).get("body") or "").strip()
+                        if text.lower() in set(config.CONTENT.get("greetings",[])):
+                            _send_whatsapp_interactive_menu(sender)
+                        elif text:
+                            process_whatsapp_message(sender,text,profile)
+                    elif mtype=="interactive":
+                        inter=msg.get("interactive") or {}
+                        bid=((inter.get("list_reply") or {}).get("id") or (inter.get("button_reply") or {}).get("id") or "")
+                        if bid: _process_whatsapp_button(sender,bid,profile)
+                    elif mtype=="image":
+                        # Meta photo handling requires downloading the media id with the configured token;
+                        # current deployment keeps the safe text fallback until photo-media ingestion is configured.
+                        _ORIG_WA_SEND_TEXT(sender,TEXT_FALLBACK.get("photo_wrong",""))
+        return jsonify({"ok":True})
+    except Exception as e:
+        logger.exception("WA text-pack: %s",e); return jsonify({"ok":False}),500
+app.view_functions["whatsapp_webhook"] = _whatsapp_webhook_textpack
+
+# 9PM Sunday parent-report alias (new route; existing legacy route remains compatible).
+app.add_url_rule("/api/cron/parent-report-9pm", endpoint="cron_parent_report_9pm", view_func=_cron_parent_report_textpack, methods=["GET","POST"])
+
+# Pro expiry reminders route already exists in the additive layer; use current profile fields.
+
+
+def _api_galti_textpack():
+    client_id=(request.args.get("client_id") or "").strip()
+    if not client_id: return jsonify({"ok":False,"error":"client_id required"}),400
+    uid=f"web:{client_id}"; is_pro=db.is_pro(uid)
+    limit=int(request.args.get("limit",50 if is_pro else config.GALTI_FREE_VISIBLE))
+    limit=min(100 if is_pro else config.GALTI_FREE_VISIBLE,max(1,limit))
+    all_preview=db.get_mistakes(uid,limit=max(config.GALTI_FREE_VISIBLE,20))
+    return jsonify({"ok":True,"mistakes":db.get_mistakes(uid,limit=limit),"locked_count":0 if is_pro else max(0,len(all_preview)-config.GALTI_FREE_VISIBLE),"pro":is_pro})
+app.view_functions["api_galti_diary"]=_api_galti_textpack
+
+
+
+@app.route('/api/resource/notes-preview', methods=['GET','POST'])
+def api_notes_preview_textpack():
+    data=request.get_json(silent=True) if request.method=='POST' else request.args
+    data=data or {}
+    topic=str(data.get('topic') or data.get('question') or '').strip()
+    uid=str(data.get('uid') or data.get('client_id') or '').strip()
+    if not topic: return jsonify({'ok':False,'error':'topic required'}),400
+    is_pro=db.is_pro(uid) if uid else False
+    count=int(config.CONTENT.get('notes_preview',{}).get('pro_visible' if is_pro else 'free_visible',5 if is_pro else 2))
+    prompt=f"Create exactly {count} compact study notes for this topic. Each note should be a distinct high-yield point. Topic: {topic}"
+    answer=run_ai(ai.answer,prompt,'notes',is_pro=is_pro,language=db.get_language(uid) if uid else 'hinglish')
+    return jsonify({'ok':True,'notes':answer,'visible':count,'locked_message':'' if is_pro else config.CONTENT.get('notes_preview',{}).get('locked_message','').format(price=config.PRO_PRICE_INR),'pro':is_pro})
+
+@app.route('/api/export/full-backup-pdf')
+def api_full_backup_pdf_textpack():
+    uid=str(request.args.get('uid') or request.args.get('client_id') or '').strip()
+    if not uid: return jsonify({'ok':False,'error':'uid/client_id required'}),400
+    if not db.is_pro(uid): return jsonify({'ok':False,'error':'Full Backup PDF is PRO-only'}),403
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.units import mm
+    except Exception:
+        return jsonify({'ok':False,'error':'reportlab not installed'}),503
+    user=db.get_user(uid) or {}; mistakes=db.get_mistakes(uid,limit=50)
+    phone=normalize_phone(user.get('phone_number',''))
+    history=[]
+    if phone and supa.enabled:
+        rows=supa.select_many('personal_history',{'phone_number':f'eq.{phone}'},limit=100,columns='asked_at,question,tool,subject,is_correct')
+        history=rows or []
+    from io import BytesIO
+    buf=BytesIO(); c=canvas.Canvas(buf,pagesize=A4); width,height=A4; y=height-20*mm
+    c.setTitle(str(config.CONTENT.get('backup_pdf',{}).get('title',config.BRAND_NAME)))
+    c.setFont('Helvetica-Bold',16); c.drawString(18*mm,y,config.BRAND_NAME); y-=9*mm
+    c.setFont('Helvetica',10)
+    lines=[
+        f"Name: {user.get('full_name',config.DEFAULT_STUDENT_NAMES['generic'])}",
+        f"Phone: {phone or 'not connected'}", f"Plan: {user.get('plan','free')}",
+        f"XP: {user.get('xp',0)} | Level: {user.get('level',1)} | Coins: {user.get('coins',0)} | Streak: {user.get('streak',0)}",
+        f"Board: {user.get('board','')} | Course: {user.get('course','')} | Exam: {user.get('exam_type','')}",
+        '', 'GALTI DIARY'
+    ]+[f"- {m.get('question','')[:160]}" for m in mistakes[:50]]+['','RECENT STUDY HISTORY']+[f"- {h.get('subject','general')}: {h.get('question','')[:150]}" for h in history[:100]]
+    for line in lines:
+        if y<20*mm: c.showPage(); y=height-20*mm; c.setFont('Helvetica',10)
+        c.drawString(18*mm,y,str(line)[:150]); y-=5.5*mm
+    c.showPage(); c.save(); buf.seek(0)
+    from flask import send_file
+    return send_file(buf,mimetype='application/pdf',as_attachment=True,download_name='saarthibhai-full-backup.pdf')
+
+
+# ============================================================================
+# FINAL 12-POINT HARDENING LAYER
+# Everything below is additive and uses runtime config + environment secrets.
+# ============================================================================
+
+
+# ============================================================================
+# Discord + Reddit channel adapters (disabled by config unless explicitly enabled)
+# ============================================================================
+def _reddit_authorized_v8() -> bool:
+    if not config.REDDIT_ENABLED or not config.REDDIT_BACKEND_TOKEN:
+        return False
+    return hmac.compare_digest(request.headers.get('Authorization',''),f'Bearer {config.REDDIT_BACKEND_TOKEN}')
+
+def _discord_http_verify_v8(raw_body: bytes) -> bool:
+    try:
+        from nacl.exceptions import BadSignatureError
+        from nacl.signing import VerifyKey
+    except Exception:
+        return False
+    if not config.DISCORD_PUBLIC_KEY: return False
+    sig=request.headers.get('X-Signature-Ed25519',''); ts=request.headers.get('X-Signature-Timestamp','')
+    if len(sig)!=128 or not ts: return False
+    try:
+        VerifyKey(bytes.fromhex(config.DISCORD_PUBLIC_KEY)).verify(ts.encode('utf-8')+raw_body,bytes.fromhex(sig)); return True
+    except (ValueError,BadSignatureError): return False
+
+def _discord_http_register_command_v8() -> bool:
+    if not (config.DISCORD_ENABLED and config.DISCORD_BOT_TOKEN and config.DISCORD_APPLICATION_ID): return False
+    command={'name':config.DISCORD_COMMAND_NAME,'description':config.DISCORD_COMMAND_DESCRIPTION,'type':1,'options':[{'name':'question','description':config.CONTENT.get('discord_question_description','Padhai ka sawaal'),'type':3,'required':True,'max_length':1800}]}
+    url=(f"https://discord.com/api/v10/applications/{config.DISCORD_APPLICATION_ID}/guilds/{config.DISCORD_GUILD_ID}/commands" if config.DISCORD_GUILD_ID else f"https://discord.com/api/v10/applications/{config.DISCORD_APPLICATION_ID}/commands")
+    try:
+        r=requests.post(url,headers={'Authorization':f'Bot {config.DISCORD_BOT_TOKEN}','Content-Type':'application/json'},json=command,timeout=15)
+        return bool(r.ok)
+    except Exception: return False
+
+def _discord_http_edit_original_v8(token: str, content: str) -> None:
+    if not config.DISCORD_APPLICATION_ID or not token: return
+    try:
+        requests.patch(f"https://discord.com/api/v10/webhooks/{config.DISCORD_APPLICATION_ID}/{token}/messages/@original",json={'content':(content or '')[:config.DISCORD_MAX_RESPONSE_CHARS]},timeout=20)
+    except Exception: pass
+
+def _discord_http_process_v8(interaction: dict) -> None:
+    try:
+        user=(interaction.get('member') or {}).get('user') or interaction.get('user') or {}
+        user_id=str(user.get('id') or ''); display=str(user.get('global_name') or user.get('username') or config.DEFAULT_STUDENT_NAMES.get('discord','Discord Student'))
+        options=interaction.get('data',{}).get('options') or []
+        question=''
+        for opt in options:
+            if str(opt.get('name'))=='question' or int(opt.get('type') or 0)==3: question=str(opt.get('value') or '')
+        if not user_id or not question.strip(): return _discord_http_edit_original_v8(interaction.get('token',''),config.SYSTEM_PROTOCOL.get('public_error_no_response',''))
+        uid=f'discord:{user_id}'; db.ensure_user(uid,full_name=display,platform='discord'); is_pro=db.is_pro(uid)
+        if db.is_banned(uid): ans=format_ban_active_message(db.get_ban_remaining_seconds(uid))
+        elif contains_abuse(question):
+            count,banned=db.record_abuse_warning(uid); ans=format_abuse_warning_message(count,banned)
+        else:
+            tool=detect_tool_from_text(question)
+            if tool in config.PRO_ONLY_TOOLS and not is_pro: ans=config.PRODUCT_TEXT.get('pro_tool','Pro feature hai.')
+            else:
+                if not is_pro:
+                    can,_=db.try_consume_quota(uid)
+                    if not can: ans=config.PRODUCT_TEXT.get('free_limit','Free limit khatam.')
+                    else: ans=None
+                else: ans=None
+                if ans is None:
+                    u=db.get_user(uid) or {}
+                    ans=get_ai_answer_v9(question,tool,is_pro,language=db.get_language(uid),phone_number=u.get('phone_number',''),exam_type=u.get('exam_type',''),subject=u.get('subject',''),uid=uid)
+                    db.track_activity(uid); db.add_personal_history(uid,question,tool=tool,source_cache='discord'); db.add_xp(uid,config.XP_QUESTION*(config.PRO_XP_MULTIPLIER if is_pro else 1)); schedule_spaced_reminders(uid,question,tool)
+                    if not is_pro: ans=f"{ans}\n\n{config.FREE_UPSELL_LINE}"
+        _discord_http_edit_original_v8(interaction.get('token',''),ans or config.SYSTEM_PROTOCOL.get('public_error_no_response',''))
+    except Exception:
+        logger.exception('Discord HTTP interaction failed')
+        _discord_http_edit_original_v8(interaction.get('token',''),config.SYSTEM_PROTOCOL.get('public_error_no_response',''))
+
+@app.route('/webhook/discord',methods=['POST'])
+def discord_interactions_webhook_v8():
+    raw=request.get_data(cache=True)
+    if not _discord_http_verify_v8(raw): return jsonify({'ok':False,'error':'invalid_signature'}),401
+    payload=request.get_json(silent=True) or {}; itype=int(payload.get('type') or 0)
+    if itype==1: return jsonify({'type':1}),200
+    if itype!=2: return jsonify({'type':4,'data':{'content':config.CONTENT.get('discord_unsupported_message','SaarthiBhai supports study slash commands.')}}),200
+    Thread(target=_discord_http_process_v8,args=(payload,),daemon=True,name='discord-http-answer').start()
+    return jsonify({'type':5}),200
+
+@app.route('/webhook/reddit',methods=['POST'])
+def reddit_webhook_bridge_v8():
+    if not _reddit_authorized_v8(): return jsonify({'ok':False,'error':'unauthorized'}),403
+    body=request.get_json(silent=True) or {}; event_id=str(body.get('event_id') or body.get('comment_id') or secrets.token_hex(12)).strip(); text_msg=str(body.get('text') or body.get('comment_body') or '').strip(); author_id=str(body.get('author_id') or body.get('author_name') or 'anonymous').strip(); author_name=str(body.get('author_name') or config.DEFAULT_STUDENT_NAMES.get('reddit','Reddit Student')).strip(); subreddit=str(body.get('subreddit') or '').strip(); comment_id=str(body.get('comment_id') or '').strip()
+    if not text_msg: return jsonify({'ok':True,'ignored':True,'reason':'empty'})
+    if not config.REDDIT_AUTO_REPLY: return jsonify({'ok':True,'ignored':True,'reason':'auto_reply_disabled'})
+    if config.REDDIT_TRIGGER_PREFIX and config.REDDIT_TRIGGER_PREFIX.lower() not in text_msg.lower(): return jsonify({'ok':True,'ignored':True,'reason':'trigger_not_found'})
+    if db.redis:
+        try:
+            if not db.redis.set(f'reddit:event:{event_id}','1',nx=True,ex=86400*7): return jsonify({'ok':True,'duplicate':True})
+        except Exception: pass
+    uid=f'reddit:{author_id}'; db.ensure_user(uid,full_name=author_name,platform='reddit'); db.set_channel_identity(uid,'reddit_user_id',author_id)
+    if subreddit: db.set_channel_identity(uid,'reddit_subreddit',subreddit)
+    if db.is_banned(uid): return jsonify({'ok':True,'reply':format_ban_active_message(db.get_ban_remaining_seconds(uid))})
+    if contains_abuse(text_msg): count,banned=db.record_abuse_warning(uid); return jsonify({'ok':True,'reply':format_abuse_warning_message(count,banned),'moderation':True})
+    cleaned=re.sub(re.escape(config.REDDIT_TRIGGER_PREFIX),'',text_msg,count=1,flags=re.IGNORECASE).strip(' :,-') if config.REDDIT_TRIGGER_PREFIX else text_msg
+    cleaned=cleaned or config.CONTENT.get('reddit_empty_question','Bhai mujhe padhai me help chahiye.')
+    is_pro=db.is_pro(uid); tool=detect_tool_from_text(cleaned)
+    if tool in config.PRO_ONLY_TOOLS and not is_pro: return jsonify({'ok':True,'reply':config.PRODUCT_TEXT.get('pro_tool','Pro feature hai.')})
+    if not is_pro:
+        can,_=db.try_consume_quota(uid)
+        if not can: return jsonify({'ok':True,'reply':config.PRODUCT_TEXT.get('free_limit','Free limit khatam.')})
+    u=db.get_user(uid) or {}; answer=get_ai_answer_v9(cleaned,tool,is_pro,language=db.get_language(uid),phone_number=u.get('phone_number',''),exam_type=u.get('exam_type',''),subject=u.get('subject',''),uid=uid) or config.SYSTEM_PROTOCOL.get('public_error_no_response','')
+    db.track_activity(uid); db.add_personal_history(uid,cleaned,tool=tool,source_cache='reddit'); db.add_xp(uid,config.XP_QUESTION*(config.PRO_XP_MULTIPLIER if is_pro else 1)); schedule_spaced_reminders(uid,cleaned,tool)
+    if not is_pro: answer=f"{answer}\n\n{config.FREE_UPSELL_LINE}"
+    return jsonify({'ok':True,'reply':answer[:config.REDDIT_MAX_REPLY_CHARS],'comment_id':comment_id,'subreddit':subreddit})
+
+# -- Supabase profile sync: study_mode + learner_track --
+_ORIG_SYNC_FINAL = Database.sync_user_to_supabase
+def _sync_user_final(self, uid, user=None):
+    u=user or self.get_user(uid)
+    ok=_ORIG_SYNC_FINAL(self,uid,u)
+    try:
+        if self.supabase.enabled and u:
+            phone=normalize_phone(u.get('phone_number',''))
+            if phone:
+                self.supabase.upsert('users',{
+                    'phone_number':phone,
+                    'learner_track':u.get('learner_track','school_college') or 'school_college',
+                    'study_mode':u.get('study_mode','') or '',
+                    'board':u.get('board','') or '',
+                    'course':u.get('course','') or '',
+                    'class_level':u.get('class_level','') or '',
+                    'semester':u.get('semester','') or '',
+                    'student_type':u.get('student_type','') or '',
+                    'target_exam':u.get('target_exam',u.get('exam_type','')) or '',
+                },'phone_number')
+    except Exception: pass
+    return ok
+Database.sync_user_to_supabase=_sync_user_final
+
+# -- Telegram: answer-action buttons and free photo solving --
+_ORIG_TELEGRAM_CALLBACK_FINAL = callback
+async def callback_final(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q=update.callback_query
+    data=(q.data or '') if q else ''
+    if data.startswith('textaction_'):
+        await q.answer()
+        user=update.effective_user
+        uid=user.id if user else 0
+        is_pro=db.is_pro(uid)
+        action_id=data.split('_',1)[1]
+        action=next((a for a in TEXT_ACTIONS if str(a.get('id'))==action_id),None)
+        if not action: return
+        tool=str(action.get('tool') or 'general')
+        if tool in PRO_ONLY_TOOLS and not is_pro:
+            await reply(update,config.PRODUCT_TEXT.get('pro_tool',TEXT_FALLBACK.get('busy','Pro feature hai.')),InlineKeyboardMarkup([[InlineKeyboardButton(f"💎 Upgrade ₹{config.PRO_PRICE_INR}",callback_data='menu_upgrade')]]))
+            return
+        db.set_tool(uid,tool)
+        await reply(update,f"✅ {action.get('label',action_id)} select ho gaya. Ab topic/question bhej de bhai.")
+        return
+    await _ORIG_TELEGRAM_CALLBACK_FINAL(update,context)
+callback=callback_final
+
+async def handle_photo_v9(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user=update.effective_user
+    if not user or not update.message or not update.message.photo: return
+    uid=user.id; db.track_activity(uid)
+    is_pro=db.is_pro(uid)
+    if not is_pro:
+        can,quota=db.try_consume_quota(uid)
+        if not can:
+            await reply(update,config.PRODUCT_TEXT.get('free_limit',TEXT_FALLBACK.get('busy','Free limit khatam.'))); return
+    try:
+        photo=update.message.photo[-1]
+        file=await context.bot.get_file(photo.file_id)
+        img_bytes=bytes(await file.download_as_bytearray())
+        caption=(update.message.caption or '').strip()
+        answer=run_ai(ai.answer_with_image,img_bytes,'image/jpeg',caption,'ocr',is_pro)
+        if not answer or str(answer).startswith('ERROR:') or answer==SOFT_FAIL_MSG:
+            answer=_fallback_youtube_answer(caption or config.CONTENT.get('photo_fallback_topic','study question'),is_pro,db.get_language(uid))
+        u=db.ensure_user(uid,user.username or '',user.full_name or config.DEFAULT_STUDENT_NAMES['generic'])
+        db.add_personal_history(uid,caption or 'Photo question',tool='ocr')
+        xp,level=db.add_xp(uid,config.XP_QUESTION*(config.PRO_XP_MULTIPLIER if is_pro else 1))
+        await reply(update,answer+f"\n\n⭐ +{config.XP_QUESTION*(config.PRO_XP_MULTIPLIER if is_pro else 1)} XP | Level {level}",_text_action_keyboard(is_pro))
+    except Exception:
+        logger.exception('Telegram photo v9')
+        await reply(update,TEXT_FALLBACK.get('photo_wrong','Photo processing unavailable right now.'))
+handle_photo=handle_photo_v9
+
+async def handle_document_v9(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user=update.effective_user
+    if not user or not update.message or not update.message.document: return
+    doc=update.message.document; uid=user.id; db.track_activity(uid); is_pro=db.is_pro(uid)
+    if not is_pro:
+        can,quota=db.try_consume_quota(uid)
+        if not can:
+            await reply(update,config.PRODUCT_TEXT.get('free_limit',TEXT_FALLBACK.get('busy','Free limit khatam.'))); return
+    # The platform can impose its own file-size limit; this app-side limit is configurable.
+    if int(getattr(doc,'file_size',0) or 0) > config.TELEGRAM_DOCUMENT_MAX_BYTES:
+        await reply(update,config.CONTENT.get('telegram_document_hint','File thoda chhota bhej de bhai.')); return
+    try:
+        file=await context.bot.get_file(doc.file_id)
+        blob=bytes(await file.download_as_bytearray())
+        mime=str(getattr(doc,'mime_type','') or 'application/pdf')
+        caption=(update.message.caption or '').strip()
+        answer=run_ai(ai.answer_with_image,blob,mime,caption,'ocr' if 'image' not in mime else 'ocr',is_pro)
+        if not answer or str(answer).startswith('ERROR:') or answer==SOFT_FAIL_MSG:
+            answer=_fallback_youtube_answer(caption or config.CONTENT.get('photo_fallback_topic','study question'),is_pro,db.get_language(uid))
+        db.add_personal_history(uid,caption or doc.file_name or 'Document question',tool='ocr')
+        xp,level=db.add_xp(uid,config.XP_QUESTION*(config.PRO_XP_MULTIPLIER if is_pro else 1))
+        await reply(update,answer+f"\n\n⭐ +{config.XP_QUESTION*(config.PRO_XP_MULTIPLIER if is_pro else 1)} XP | Level {level}",_text_action_keyboard(is_pro))
+    except Exception:
+        logger.exception('Telegram document v9')
+        await reply(update,TEXT_FALLBACK.get('photo_wrong','Document processing unavailable right now.'))
+
+handle_document=handle_document_v9
+
+# Make every normal Telegram text answer end with the six action buttons.
+_ORIG_PROCESS_QUESTION_FINAL=process_question
+async def process_question_final(update, context, text, tool='general'):
+    await _ORIG_PROCESS_QUESTION_FINAL(update,context,text,tool)
+    try:
+        if update and getattr(update,'message',None) and str(text or '').strip():
+            uid=update.effective_user.id if update.effective_user else 0
+            await reply(update,config.CONTENT.get('api_labels',{}).get('quick_actions_title',''),_text_action_keyboard(db.is_pro(uid)))
+    except Exception: pass
+process_question=process_question_final
+
+# -- WhatsApp image question support + post-answer menu --
+def _whatsapp_download_media(media_id: str):
+    if not media_id or not config.WHATSAPP_TOKEN or not config.WHATSAPP_PHONE_NUMBER_ID: return None,''
+    try:
+        base=config.URLS['whatsapp_graph_base_url']; headers={'Authorization':f'Bearer {config.WHATSAPP_TOKEN}'}
+        meta=requests.get(f"{base}/{config.WHATSAPP_API_VERSION}/{media_id}",headers=headers,timeout=15)
+        if meta.status_code>=300: return None,''
+        media_url=str((meta.json() or {}).get('url') or '')
+        if not media_url: return None,''
+        blob=requests.get(media_url,headers=headers,timeout=20)
+        if blob.status_code>=300: return None,''
+        return blob.content,str((meta.json() or {}).get('mime_type') or 'image/jpeg')
+    except Exception:
+        logger.exception('WhatsApp media download')
+        return None,''
+
+def _send_whatsapp_answer_menu(to_number: str):
+    return _send_whatsapp_interactive_menu(to_number)
+
+_ORIG_WA_PROCESS_FINAL=process_whatsapp_message
+def process_whatsapp_message_final(from_number: str, text: str, profile_name: str = '') -> None:
+    _ORIG_WA_PROCESS_FINAL(from_number,text,profile_name)
+    try:
+        if text and str(text).strip(): _send_whatsapp_answer_menu(from_number)
+    except Exception: pass
+process_whatsapp_message=process_whatsapp_message_final
+
+def _whatsapp_webhook_final():
+    if request.method=='GET':
+        if request.args.get('hub.mode')=='subscribe' and request.args.get('hub.verify_token')==config.WHATSAPP_VERIFY_TOKEN:
+            return request.args.get('hub.challenge'),200
+        return 'Forbidden',403
+    try:
+        body=request.get_json(force=True,silent=True) or {}
+        for ent in body.get('entry',[]):
+            for change in ent.get('changes',[]):
+                value=change.get('value',{}); contacts=value.get('contacts',[]); profile=(contacts[0].get('profile',{}).get('name','') if contacts else '')
+                for msg in value.get('messages',[]):
+                    sender=str(msg.get('from') or '');
+                    if not sender: continue
+                    mtype=str(msg.get('type') or '')
+                    if mtype=='text':
+                        text=str((msg.get('text') or {}).get('body') or '').strip()
+                        if text.lower() in set(config.CONTENT.get('greetings',[])):
+                            db.ensure_user(f'wa:{sender}',full_name=profile or config.DEFAULT_STUDENT_NAMES['generic'],platform='whatsapp',phone_number=sender)
+                            _send_whatsapp_interactive_menu(sender)
+                        elif text:
+                            process_whatsapp_message(sender,text,profile)
+                    elif mtype=='interactive':
+                        inter=msg.get('interactive') or {}; bid=((inter.get('list_reply') or {}).get('id') or (inter.get('button_reply') or {}).get('id') or '')
+                        if bid: _process_whatsapp_button(sender,bid,profile)
+                    elif mtype=='image':
+                        user=db.ensure_user(f'wa:{sender}',full_name=profile or config.DEFAULT_STUDENT_NAMES['generic'],platform='whatsapp',phone_number=sender)
+                        is_pro=db.is_pro(f'wa:{sender}')
+                        if not is_pro:
+                            can,_quota=db.try_consume_quota(f'wa:{sender}')
+                            if not can:
+                                _ORIG_WA_SEND_TEXT(sender,config.PRODUCT_TEXT.get('free_limit',TEXT_FALLBACK.get('busy','Free limit khatam.'))); continue
+                        media=((msg.get('image') or {}).get('id') or '')
+                        caption=str((msg.get('image') or {}).get('caption') or '').strip()
+                        blob,mime=_whatsapp_download_media(media)
+                        if not blob:
+                            _ORIG_WA_SEND_TEXT(sender,TEXT_FALLBACK.get('photo_wrong','Photo processing unavailable right now.')); continue
+                        answer=run_ai(ai.answer_with_image,blob,mime,caption,'ocr',is_pro)
+                        if not answer or str(answer).startswith('ERROR:') or answer==SOFT_FAIL_MSG:
+                            answer=_fallback_youtube_answer(caption or config.CONTENT.get('photo_fallback_topic','study question'),is_pro,db.get_language(f'wa:{sender}'))
+                        db.add_personal_history(f'wa:{sender}',caption or 'Photo question',tool='ocr')
+                        db.add_xp(f'wa:{sender}',config.XP_QUESTION*(config.PRO_XP_MULTIPLIER if is_pro else 1))
+                        _ORIG_WA_SEND_TEXT(sender,answer)
+                        _send_whatsapp_answer_menu(sender)
+        return jsonify({'ok':True})
+    except Exception as e:
+        logger.exception('WhatsApp final webhook: %s',e); return jsonify({'ok':False}),500
+app.view_functions['whatsapp_webhook']=_whatsapp_webhook_final
+
+
+# -- Teacher Pro/status helpers ------------------------------------------------
+@app.route('/api/teacher/status')
+def api_teacher_status():
+    client_id=str(request.args.get('client_id') or '').strip(); uid='web:'+client_id if client_id and not client_id.startswith('web:') else client_id
+    if not uid: return jsonify({'ok':False,'error':'client_id required'}),400
+    u=db.ensure_user(uid,full_name=config.DEFAULT_STUDENT_NAMES['teacher'],platform='web')
+    classes,students=_teacher_class_limit(uid)
+    return jsonify({'ok':True,'teacher_plan':u.get('teacher_plan','free'),'teacher_pro_until':u.get('teacher_pro_until',''),'max_classes':classes,'max_students_per_class':students,'teacher_pro_price_inr':int(TEXT_PRO_GROWTH['teacher_pro_price_inr'])})
+
+# -- Teacher Pro payment --
+def _teacher_pro_until(user):
+    try:
+        raw=str((user or {}).get('teacher_pro_until') or '').replace('Z','+00:00')
+        if not raw: return None
+        dt=datetime.fromisoformat(raw)
+        if dt.tzinfo is None: dt=dt.replace(tzinfo=IST)
+        return dt
+    except Exception: return None
+
+def _teacher_activate(uid: str):
+    user=db.get_user(uid) or db.ensure_user(uid,full_name=config.DEFAULT_STUDENT_NAMES['teacher'],platform='web')
+    base=_teacher_pro_until(user) or _now_ist()
+    if base<_now_ist(): base=_now_ist()
+    days=int(TEXT_PRO_GROWTH['teacher_pro_days'])
+    until=base+timedelta(days=days)
+    user['teacher_plan']='pro'; user['teacher_pro_until']=until.isoformat()
+    db.save_user(uid,user); db.sync_user_to_supabase(uid,user)
+    return until
+
+@app.route('/api/teacher/create-order',methods=['POST'])
+def api_teacher_create_order():
+    data=request.get_json(silent=True) or {}; uid=str(data.get('uid') or data.get('client_id') or '').strip()
+    if uid and not uid.startswith('web:'): uid='web:'+uid
+    if not uid: return jsonify({'ok':False,'error':config.CONTENT.get('integration_messages',{}).get('teacher_upgrade','Teacher Pro required.')}),400
+    price=int(TEXT_PRO_GROWTH['teacher_pro_price_inr'])
+    order=create_razorpay_order(uid,price)
+    if 'error' in order: return jsonify(order),400
+    oid=str(order.get('id') or '')
+    if oid and db.redis:
+        db.redis.hset(f'teacher:pay:pending:{oid}',mapping={'uid':uid,'created_at':_now_ist().isoformat(),'status':'created'})
+        db.redis.expire(f'teacher:pay:pending:{oid}',86400*10)
+    return jsonify({'ok':True,'id':oid,'amount':order.get('amount'),'currency':order.get('currency','INR'),'price_inr':price})
+
+@app.route('/api/teacher/verify-payment',methods=['POST'])
+def api_teacher_verify_payment():
+    data=request.get_json(silent=True) or {}; payment_id=str(data.get('payment_id') or '').strip(); order_id=str(data.get('order_id') or '').strip(); uid=str(data.get('uid') or data.get('client_id') or '').strip()
+    if uid and not uid.startswith('web:'): uid='web:'+uid
+    if not payment_id: return jsonify({'ok':False,'error':'payment_id required'}),400
+    try:
+        auth=base64.b64encode(f"{config.RAZORPAY_KEY_ID}:{config.RAZORPAY_KEY_SECRET}".encode()).decode()
+        r=requests.get(f"{config.URLS['razorpay_payments']}/{payment_id}",headers={'Authorization':f'Basic {auth}'},timeout=20)
+        data=r.json() if r.content else {}
+        if r.status_code>=400: return jsonify({'ok':False,'error':'Payment lookup failed'}),400
+        if str(data.get('status','')).lower()!='captured': return jsonify({'ok':False,'error':config.CONTENT.get('integration_messages',{}).get('teacher_payment_pending','Teacher payment pending.')}),409
+        expected=int(TEXT_PRO_GROWTH['teacher_pro_price_inr'])*100
+        if int(data.get('amount') or 0)<expected: return jsonify({'ok':False,'error':'Amount mismatch'}),400
+        notes=data.get('notes') or {}; note_uid=str(notes.get('user_id') or uid).strip()
+        if uid and note_uid and uid!=note_uid: return jsonify({'ok':False,'error':'User mismatch'}),400
+        uid=note_uid
+        if order_id and data.get('order_id') and str(data.get('order_id'))!=order_id: return jsonify({'ok':False,'error':'Order mismatch'}),400
+        if not uid: return jsonify({'ok':False,'error':'uid missing'}),400
+        _teacher_activate(uid)
+        if db.redis and order_id: db.redis.hset(f'teacher:pay:pending:{order_id}',mapping={'status':'captured','payment_id':payment_id})
+        return jsonify({'ok':True,'teacher_plan':'pro','teacher_pro_until':(_teacher_pro_until(db.get_user(uid)) or _now_ist()).isoformat(),'message':config.CONTENT.get('integration_messages',{}).get('teacher_payment_success','Teacher Pro unlocked.')})
+    except Exception as e:
+        logger.exception('teacher verify: %s',e); return jsonify({'ok':False,'error':str(e)}),500
+
+# Extend payment reconciliation with Teacher Pro orders; student payment behavior remains intact.
+_ORIG_PAYMENT_RECONCILE=app.view_functions.get('cron_payment_reconcile')
+def cron_payment_reconcile_final():
+    base=_ORIG_PAYMENT_RECONCILE() if _ORIG_PAYMENT_RECONCILE else jsonify({'ok':True})
+    teacher_checked=teacher_activated=0
+    if db.redis and config.RAZORPAY_KEY_ID and config.RAZORPAY_KEY_SECRET:
+        for key in list(db.redis.scan_iter(match='teacher:pay:pending:*',count=100)):
+            oid=str(key).split('teacher:pay:pending:',1)[-1]; meta=db.redis.hgetall(key) or {}; uid=str(meta.get('uid') or '')
+            if not uid or meta.get('status')=='captured': continue
+            teacher_checked+=1
+            try:
+                auth=base64.b64encode(f"{config.RAZORPAY_KEY_ID}:{config.RAZORPAY_KEY_SECRET}".encode()).decode()
+                r=requests.get(f"{config.URLS['razorpay_orders']}/{oid}/payments",headers={'Authorization':f'Basic {auth}'},timeout=20)
+                items=(r.json() or {}).get('items') or [] if r.status_code<300 else []
+                captured=next((p for p in items if str(p.get('status','')).lower()=='captured'),None)
+                if captured:
+                    pid=str(captured.get('id') or ''); _teacher_activate(uid); db.redis.hset(key,mapping={'status':'captured','payment_id':pid}); teacher_activated+=1
+                else:
+                    created=str(meta.get('created_at') or '')
+                    dt=datetime.fromisoformat(created.replace('Z','+00:00')) if created else _now_ist();
+                    if dt.tzinfo is None: dt=dt.replace(tzinfo=IST)
+                    if (_now_ist()-dt).total_seconds()>=300 and meta.get('status')!='screenshot_requested':
+                        _send_user_push(db.get_user(uid) or {},TEXT_FALLBACK.get('payment_pending','') or TEXT_FEATURES.get('integration_messages',{}).get('teacher_payment_pending',''))
+                        try:
+                            _teacher_activate(uid)
+                            db.redis.hset(key, mapping={'status':'screenshot_requested','extra_day_granted':'1'})
+                        except Exception:
+                            db.redis.hset(key,'status','screenshot_requested')
+            except Exception: pass
+    try:
+        data=base.get_json(silent=True) if hasattr(base,'get_json') else None
+        if isinstance(data,dict): data['teacher_checked']=teacher_checked; data['teacher_activated']=teacher_activated; return jsonify(data)
+    except Exception: pass
+    return base
+app.view_functions['cron_payment_reconcile']=cron_payment_reconcile_final
+
+# -- Sunday/3AM/feature endpoints and complete backup content are already present. --
 
 
 if __name__ == "__main__":
     # threaded=True lets Flask's dev server handle multiple concurrent
     # requests (AI calls already run off-thread via the pool, so the web
     # worker itself must not block on them). For real production traffic,
-    # Production on Render Free: prefer http_interactions mode; keep ONE process when embedding a Gateway.
-    # session exists. Use: gunicorn --workers 1 --threads 4 app:app
+    # run behind gunicorn with multiple workers instead of this dev server:
+    #   gunicorn -w 4 -k gthread --threads 8 -b 0.0.0.0:$PORT studygenie_bot:app
     app.run(host="0.0.0.0", port=config.PORT, threaded=True)
