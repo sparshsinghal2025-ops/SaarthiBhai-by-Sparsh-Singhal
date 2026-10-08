@@ -6,6 +6,12 @@ google-genai
 groq
 python-telegram-bot
 reportlab
+PyYAML
 discord.py
 PyNaCl
 gunicorn
+python-pptx
+mcp
+starlette
+uvicorn
+youtube-transcript-api
