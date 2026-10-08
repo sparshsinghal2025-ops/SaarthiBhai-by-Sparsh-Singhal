@@ -4,7 +4,7 @@
     "creator_name": "Sparsh Singhal",
     "creator_photo_url": "/sparsh.jpg",
     "creator_story_url": "/about",
-    "version": "SaarthiBhai v7.2",
+    "version": "SaarthiBhai v8.0 – 12-Point Feature Pack",
     "timezone": "Asia/Kolkata",
     "date_format": "%Y-%m-%d",
     "port": 5000,
@@ -23,22 +23,20 @@
     "semantic_cache_threshold": 0.92,
     "cache_ttl_sec": 3600,
     "ai_parallel_fanout": 0,
-    "library_context_enabled": true
+    "library_context_enabled": true,
+    "ai_queue_enabled": true,
+    "ai_singleflight_wait_sec": 18,
+    "ai_queue_pro_priority": true,
+    "external_api_rate_limit": 30,
+    "ai_max_concurrency": 6,
+    "ai_queue_pro_wait_sec": 18,
+    "ai_queue_free_wait_sec": 5
   },
   "ai": {
     "primary": "gemini",
     "provider_order": [
       "gemini",
-      "groq",
-      "openai",
-      "xai",
-      "deepseek",
-      "claude",
-      "perplexity",
-      "meta",
-      "mistral",
-      "qwen",
-      "openrouter"
+      "groq"
     ],
     "gemini_model": "gemini-3.8-flash",
     "gemini_flash_lite_model": "gemini-3.5-flash-lite",
@@ -75,7 +73,7 @@
     "spin_max_coins": 50,
     "referral_coins": 20,
     "trial_coins": 500,
-    "trial_referrals": 5,
+    "trial_referrals": 3,
     "trial_days": 3,
     "mission_reward_coins": 20,
     "quiz_perfect_coins": 50,
@@ -99,7 +97,11 @@
       3,
       7,
       15
-    ]
+    ],
+    "quiz_free_questions": 5,
+    "quiz_pro_questions": 10,
+    "galti_free_visible": 3,
+    "telegram_document_max_bytes": 4194304
   },
   "channels": {
     "whatsapp_api_version": "v20.0",
@@ -107,10 +109,11 @@
     "snapchat_gateway_enabled": false,
     "discord": {
       "enabled": false,
-      "message_content_intent": true,
+      "message_content_intent": false,
       "max_response_chars": 1900,
       "command_name": "ask",
-      "command_description": "SaarthiBhai se padhai ka sawaal poochho"
+      "command_description": "Ask SaarthiBhai a study question",
+      "run_mode": "http_interactions"
     },
     "reddit": {
       "enabled": false,
@@ -178,34 +181,34 @@
       "test account (hidden)"
     ],
     "feature_catalog_28": [
-      "photo_se_sawal",
-      "bol_ke_puchna",
-      "mcq_quiz",
-      "formula_sheet",
-      "short_notes",
-      "long_notes",
-      "youtube_nichod",
-      "pyq_bank",
-      "mind_map",
-      "mock_test",
-      "hint_wala_doubt",
-      "essay",
-      "resume",
-      "ppt",
-      "flashcards",
+      "ask",
+      "explain",
+      "solve",
+      "quiz",
+      "leaderboard",
+      "notes",
+      "pyq",
+      "formula",
+      "planner",
+      "ncert_solutions",
       "important_questions",
-      "eli5_child_mode",
-      "hisab",
-      "diagram",
-      "grammar",
-      "bhasha_badalna",
-      "career",
-      "timetable",
-      "revision",
-      "copy_check",
-      "current_affairs",
-      "photo_notes",
-      "viva"
+      "youtube_notes",
+      "mcq_generator",
+      "mock_test",
+      "derivation",
+      "numerical_solver",
+      "diagram_maker",
+      "viva_preparation",
+      "galti_diary_full",
+      "assignment_maker",
+      "placement_pack",
+      "resume_maker",
+      "career_guidance",
+      "essay_writer",
+      "mind_map",
+      "sparsh_tips",
+      "roast_me",
+      "backup_pdf"
     ],
     "tool_aliases": {
       "photo_se_sawal": "general",
@@ -231,26 +234,30 @@
       "placement": "career"
     },
     "pro_only_tools": [
-      "roast",
-      "ncert",
-      "mindmap",
-      "important",
-      "diagram",
-      "derivation",
-      "numerical",
-      "mcq",
-      "essay",
-      "resume",
-      "youtube",
       "career",
-      "tips",
-      "mock",
-      "photo_notes",
-      "voice",
+      "derivation",
+      "diagram",
+      "essay",
       "flashcards",
+      "formula",
+      "important",
+      "mcq",
+      "mindmap",
+      "mock",
+      "ncert",
+      "notes",
+      "numerical",
+      "photo_notes",
+      "placement",
+      "planner",
       "ppt",
+      "pyq",
+      "resume",
+      "roast",
+      "tips",
       "viva",
-      "placement"
+      "voice",
+      "youtube"
     ],
     "tool_keywords": [
       [
@@ -505,7 +512,9 @@
       "instagram": "Instagram Student",
       "snapchat": "Snapchat Student",
       "pro": "Pro Student",
-      "generic": "Student"
+      "generic": "Student",
+      "discord": "Discord Student",
+      "reddit": "Reddit Student"
     },
     "answer_resource_copy": {
       "extras_heading": "📦 SaarthiBhai extras",
@@ -531,7 +540,624 @@
       "photo_no_answer": "Photo ka answer nahi aaya.",
       "image_too_large": "Image too large. Please use a smaller image.",
       "ai_rate_limited": "Too many requests. Wait a minute."
-    }
+    },
+    "boards": [
+      "CBSE",
+      "ICSE",
+      "NIOS",
+      "UP Board",
+      "Bihar Board",
+      "MP Board",
+      "Rajasthan Board",
+      "Maharashtra Board",
+      "Gujarat Board",
+      "West Bengal Board",
+      "Kerala Board",
+      "Tamil Nadu Board",
+      "Karnataka Board",
+      "AP Board",
+      "Telangana Board",
+      "Assam Board",
+      "Punjab Board",
+      "Haryana Board",
+      "IB Board",
+      "Cambridge Board",
+      "Odisha Board",
+      "Jharkhand Board",
+      "Chhattisgarh Board",
+      "Uttarakhand Board",
+      "Himachal Pradesh Board",
+      "Jammu and Kashmir Board",
+      "Goa Board",
+      "Tripura Board",
+      "Manipur Board",
+      "Meghalaya Board",
+      "Mizoram Board",
+      "Nagaland Board",
+      "Sikkim Board",
+      "Puducherry Board",
+      "Delhi Board"
+    ],
+    "college_courses": [
+      "B.Tech CSE",
+      "B.Tech IT",
+      "B.Tech AI/ML",
+      "B.Tech Data Science",
+      "B.Tech ECE",
+      "B.Tech Mechanical",
+      "B.Tech Civil",
+      "B.Tech Electrical",
+      "B.Tech EEE",
+      "B.Tech Chemical",
+      "B.Tech Biotechnology",
+      "BCA",
+      "MCA",
+      "BBA",
+      "MBA",
+      "B.Com",
+      "M.Com",
+      "BA",
+      "BA English",
+      "BA History",
+      "BA Political Science",
+      "BA Economics",
+      "BSc",
+      "BSc Maths",
+      "BSc Physics",
+      "BSc Chemistry",
+      "BSc Biology",
+      "B.Ed",
+      "LLB",
+      "LLM",
+      "B.Pharma",
+      "D.Pharma",
+      "BSc Nursing",
+      "GNM Nursing",
+      "BPT",
+      "BASLP",
+      "B.Arch",
+      "M.Arch",
+      "B.Des",
+      "M.Des",
+      "BFA",
+      "MFA",
+      "BJMC",
+      "MJMC",
+      "BHM",
+      "MHM",
+      "BMS",
+      "BBM",
+      "BSW",
+      "MSW",
+      "B.Lib",
+      "M.Lib",
+      "BCA Data Science",
+      "BCA AI",
+      "B.Tech Robotics",
+      "B.Tech Aerospace",
+      "B.Tech Automobile",
+      "B.Tech Instrumentation"
+    ],
+    "competitive_exams": [
+      "JEE Main",
+      "JEE Advanced",
+      "NEET",
+      "CUET",
+      "CUET PG",
+      "UPSC CSE",
+      "UPSC CDS",
+      "NDA",
+      "SSC CGL",
+      "SSC CHSL",
+      "SSC GD",
+      "SSC MTS",
+      "Banking PO",
+      "Banking Clerk",
+      "IBPS PO",
+      "SBI Clerk",
+      "Railway RRB NTPC",
+      "Railway Group D",
+      "Railway JE",
+      "CTET",
+      "UPTET",
+      "GATE",
+      "CAT",
+      "XAT",
+      "MAT",
+      "CLAT",
+      "AILET",
+      "Olympiad",
+      "UPPSC",
+      "BPSC",
+      "MPPSC",
+      "RPSC",
+      "MPSC"
+    ],
+    "subjects_universe": [
+      "DBMS",
+      "OS",
+      "DSA",
+      "CN",
+      "Python",
+      "Java",
+      "C",
+      "C++",
+      "JavaScript",
+      "TypeScript",
+      "HTML",
+      "CSS",
+      "SQL",
+      "Computer Architecture",
+      "Compiler Design",
+      "Software Engineering",
+      "Web Development",
+      "App Development",
+      "Cloud Computing",
+      "Cyber Security",
+      "Artificial Intelligence",
+      "Machine Learning",
+      "Deep Learning",
+      "Data Science",
+      "Data Analytics",
+      "Statistics",
+      "Discrete Mathematics",
+      "Engineering Mathematics",
+      "Physics",
+      "Chemistry",
+      "Maths",
+      "Mathematics",
+      "Biology",
+      "Botany",
+      "Zoology",
+      "Genetics",
+      "Microbiology",
+      "Biotechnology",
+      "Environmental Science",
+      "Polity",
+      "History",
+      "Geography",
+      "Economics",
+      "Accounts",
+      "Accountancy",
+      "Business Studies",
+      "Entrepreneurship",
+      "Finance",
+      "Marketing",
+      "Management",
+      "HRM",
+      "Business Law",
+      "Company Law",
+      "Constitution",
+      "International Relations",
+      "Sociology",
+      "Psychology",
+      "Philosophy",
+      "Anthropology",
+      "Public Administration",
+      "Social Work",
+      "Education",
+      "Pedagogy",
+      "English",
+      "Hindi",
+      "Sanskrit",
+      "French",
+      "German",
+      "Spanish",
+      "Grammar",
+      "Literature",
+      "Creative Writing",
+      "Essay Writing",
+      "Reasoning",
+      "Logical Reasoning",
+      "Quantitative Aptitude",
+      "Verbal Ability",
+      "Data Interpretation",
+      "General Knowledge",
+      "Current Affairs",
+      "General Science",
+      "Indian Economy",
+      "World Economy",
+      "Indian Geography",
+      "World Geography",
+      "Ancient History",
+      "Medieval History",
+      "Modern History",
+      "Art and Culture",
+      "Environment and Ecology",
+      "Science and Technology",
+      "Ethics",
+      "Disaster Management",
+      "Agriculture",
+      "Biochemistry",
+      "Anatomy",
+      "Physiology",
+      "Pharmacology",
+      "Pathology",
+      "Nursing",
+      "Community Medicine",
+      "Organic Chemistry",
+      "Inorganic Chemistry",
+      "Physical Chemistry",
+      "Mechanics",
+      "Thermodynamics",
+      "Electrostatics",
+      "Optics",
+      "Waves",
+      "Electronics",
+      "Semiconductor",
+      "Algorithms",
+      "Operating Systems",
+      "Database Systems",
+      "Networking",
+      "Information Security",
+      "Power Systems",
+      "Electrical Machines",
+      "Control Systems",
+      "Signals and Systems",
+      "Digital Electronics",
+      "Analog Electronics",
+      "Thermodynamics Engineering",
+      "Fluid Mechanics",
+      "Strength of Materials",
+      "Structural Analysis",
+      "Surveying",
+      "Transportation Engineering",
+      "Chemical Engineering",
+      "Process Engineering",
+      "Biomedical Engineering",
+      "Research Methodology"
+    ],
+    "student_types": {
+      "type1": {
+        "label": "Bas Pass Hona Hai",
+        "share_percent": 70,
+        "prompt": "Use easy Hinglish, short notes, 5 key points, important questions and formula sheets. Avoid long lectures."
+      },
+      "type2": {
+        "label": "Board + Competitive",
+        "share_percent": 25,
+        "prompt": "Support two modes: Board Mode = easy/NCERT/exam writing; Competitive Mode = tough/PYQ/tricks. Let the student switch."
+      },
+      "type3": {
+        "label": "Sirf Exam Crack Karna Hai",
+        "share_percent": 5,
+        "prompt": "Prioritize planner, daily targets, mock tests, weak-topic revision and exam-date countdown."
+      }
+    },
+    "onboarding_steps": [
+      {
+        "id": "student_track",
+        "title": "Kaun ho?",
+        "options": [
+          "School 6-12",
+          "College",
+          "Competitive",
+          "PhD",
+          "Teacher"
+        ]
+      },
+      {
+        "id": "education_path",
+        "title": "Kaunsa wala?",
+        "options_ref": "boards_courses_exams"
+      },
+      {
+        "id": "level",
+        "title": "Kaunsi class/sem/year?",
+        "options": [
+          "Class 6",
+          "Class 7",
+          "Class 8",
+          "Class 9",
+          "Class 10",
+          "Class 11",
+          "Class 12",
+          "Sem 1",
+          "Sem 2",
+          "Sem 3",
+          "Sem 4",
+          "Sem 5",
+          "Sem 6",
+          "Sem 7",
+          "Sem 8",
+          "Year 1",
+          "Year 2",
+          "Year 3",
+          "Year 4",
+          "2025 Aspirant",
+          "2026 Aspirant",
+          "2027 Aspirant"
+        ]
+      }
+    ],
+    "answer_actions": [
+      {
+        "id": "notes",
+        "label": "📝 Iska Notes Banao",
+        "tool": "notes"
+      },
+      {
+        "id": "pyq",
+        "label": "📜 Iska PYQ Dikhao",
+        "tool": "pyq"
+      },
+      {
+        "id": "quiz",
+        "label": "❓ Iska Quiz Lo",
+        "tool": "quiz"
+      },
+      {
+        "id": "video",
+        "label": "📺 Iska Video Dekho",
+        "tool": "youtube"
+      },
+      {
+        "id": "planner",
+        "label": "📅 Iska Planner Banao",
+        "tool": "planner"
+      },
+      {
+        "id": "formula",
+        "label": "📐 Formula Sheet De Do",
+        "tool": "formula"
+      }
+    ],
+    "fallback_messages": {
+      "busy": "Abhi thoda load hai, 2 minute me wapas aata hu — tab tak ye video dekh le:",
+      "photo_wrong": "Ye question wali photo nahi hai, question wali bhejo bhai. 📸",
+      "leak": "Leak se ek exam pass hoga, padhai se zindagi. Chalo PYQ karte hain. 📚",
+      "abuse": "Gaali se XP nahi badhega 😄 Quiz karte hain.",
+      "payment_pending": "Paise kate ho aur Pro on nahi hua? Screenshot bhej dena bhai; payment reconcile hote hi Pro sync ho jayega.",
+      "spin_used": "Aaj ka spin ho chuka hai. Kal wapas aana!"
+    },
+    "reminder_messages": {
+      "morning_6am": "Good Morning {name} ☀️ Kal streak tutne wali thi. Aaj wheel ghumayega? {spin_reward} coins mil sakte hain.",
+      "mission_5pm": "{name}, aaj ka mission ready hai — {exam} ke 2 PYQ + 1 Formula. Sirf {minutes} minute ka hai. {start_cta}",
+      "warning_8pm": "{name}, teri {streak} din ki streak khatam hone wali hai. {hours_left} ghante bache hain. Ek quiz kar ke bacha le. {save_cta}",
+      "pro_3d": "Bhai, Pro {days} din me khatam ho raha hai. Abhi renew kar le — {coins} coins bonus.",
+      "pro_1d": "Bhai, kal Pro khatam ho raha hai. Aaj renew kar le.",
+      "pro_last": "Bhai, aaj Pro ka last day hai. Renew kar le.",
+      "start_cta": "[Start Karu?]",
+      "save_cta": "[Bacha Lu?]",
+      "warning_hours_left": 2
+    },
+    "pro_growth": {
+      "blur_count_free_visible": 2,
+      "blur_note_message": "Baaki notes Pro me dekho — {price}",
+      "video_free_visible": 1,
+      "video_pro_visible": 5,
+      "referral_days": 3,
+      "referral_threshold": 3,
+      "wheel_special_pro_chance": 0.1,
+      "wheel_special_pro_days": 1,
+      "wheel_coin_rewards": [
+        50,
+        100
+      ],
+      "leaderboard_top_n": 10,
+      "teacher_free_classes": 1,
+      "teacher_free_students_per_class": 40,
+      "teacher_pro_price_inr": 99,
+      "teacher_pro_classes": 10,
+      "teacher_pro_students_per_class": 400,
+      "teacher_pro_days": 30
+    },
+    "feature_access": {
+      "free": [
+        "ask",
+        "explain",
+        "solve",
+        "quiz",
+        "leaderboard"
+      ],
+      "pro": [
+        "ask",
+        "explain",
+        "solve",
+        "quiz",
+        "leaderboard",
+        "notes",
+        "pyq",
+        "formula",
+        "planner",
+        "ncert_solutions",
+        "important_questions",
+        "youtube_notes",
+        "mcq_generator",
+        "mock_test",
+        "derivation",
+        "numerical_solver",
+        "diagram_maker",
+        "viva_preparation",
+        "galti_diary_full",
+        "assignment_maker",
+        "placement_pack",
+        "resume_maker",
+        "career_guidance",
+        "essay_writer",
+        "mind_map",
+        "sparsh_tips",
+        "roast_me",
+        "backup_pdf"
+      ]
+    },
+    "whatsapp_menu": [
+      {
+        "id": "wa_notes",
+        "title": "Notes",
+        "tool": "notes"
+      },
+      {
+        "id": "wa_pyq",
+        "title": "PYQ",
+        "tool": "pyq"
+      },
+      {
+        "id": "wa_quiz",
+        "title": "Quiz",
+        "tool": "mcq"
+      },
+      {
+        "id": "wa_planner",
+        "title": "Planner",
+        "tool": "planner"
+      },
+      {
+        "id": "wa_formula",
+        "title": "Formula",
+        "tool": "formula"
+      },
+      {
+        "id": "wa_video",
+        "title": "Video",
+        "tool": "youtube"
+      }
+    ],
+    "instagram_content_templates": {
+      "reel_followup": "Reel dekh liya? 2 min ka ek PYQ kar le? 🔥",
+      "story_poll": "Aaj ka tough kya hai?",
+      "story_options": [
+        "DBMS",
+        "OS"
+      ]
+    },
+    "phd_tools": [
+      {
+        "id": "research_topic",
+        "label": "Research Topic",
+        "prompt": "Give 10 research topic ideas with problem statement, novelty angle, scope, methods and keywords."
+      },
+      {
+        "id": "synopsis",
+        "label": "Synopsis",
+        "prompt": "Create a 2-page academic synopsis with title, background, problem, objectives, methodology, expected outcome and references placeholder."
+      },
+      {
+        "id": "thesis",
+        "label": "Thesis Help",
+        "prompt": "Create a chapter-wise thesis structure and explain what each chapter should contain."
+      },
+      {
+        "id": "journal",
+        "label": "Journal",
+        "prompt": "Suggest suitable publication venues based on topic, with a note to verify current indexing, fees and submission rules before submission."
+      },
+      {
+        "id": "viva",
+        "label": "Viva",
+        "prompt": "Generate viva questions with concise model answers and follow-up questions."
+      }
+    ],
+    "marketing": {
+      "llms_title": "SaarthiBhai — AI study assistant for Indian students",
+      "llms_summary": "SaarthiBhai by Sparsh Singhal is a gamified study assistant for school, college and competitive-exam learners. It supports notes, PYQ practice, quizzes, planners, formulas, revision, assignments and more. Students can use the web app and configured messaging/community channels.",
+      "gpt_instruction_footer": "More notes, PYQ, planner at {public_domain}",
+      "quora_reddit_disclaimer": "Use genuine first-hand experience only. Do not fabricate reviews, endorsements or rankings."
+    },
+    "greetings": [
+      "hi",
+      "hello",
+      "hey",
+      "start",
+      "namaste"
+    ],
+    "whatsapp_welcome_text": "Kya chahiye? Notes, PYQ, Quiz, Planner, Formula ya Video.",
+    "whatsapp_menu_button": "Open Menu",
+    "whatsapp_menu_section": "SaarthiBhai",
+    "provider_preferences_by_tool": {},
+    "backup_pdf": {
+      "title": "SaarthiBhai Study Backup",
+      "sections": [
+        "Profile",
+        "Progress",
+        "Mistakes",
+        "Recent Study History",
+        "Weak Topics"
+      ]
+    },
+    "notes_preview": {
+      "free_visible": 2,
+      "pro_visible": 5,
+      "locked_message": "Baaki notes Pro me dekho — {price}"
+    },
+    "channel_labels": {
+      "web": "Website",
+      "whatsapp": "WhatsApp",
+      "telegram": "Telegram",
+      "instagram": "Instagram",
+      "snapchat": "Snapchat",
+      "discord": "Discord",
+      "reddit": "Reddit"
+    },
+    "study_modes": [
+      {
+        "id": "board",
+        "label": "Board Mode",
+        "prompt": "Prioritize easy/NCERT-aligned explanation, board-style answer writing, important questions and school/college exam presentation."
+      },
+      {
+        "id": "competitive",
+        "label": "Competitive Mode",
+        "prompt": "Prioritize tougher concepts, PYQs, shortcuts, tricks, time management and competitive-exam difficulty."
+      }
+    ],
+    "integration_messages": {
+      "api_disabled": "External AI integration is not enabled yet.",
+      "api_unauthorized": "Unauthorized integration request.",
+      "queue_busy": "Abhi thoda load hai, 2 minute me wapas aata hu — tab tak ye video dekh le:",
+      "teacher_upgrade": "Teacher Pro ₹{price}/30 days me 10 classes aur 400 students per class unlock karta hai.",
+      "teacher_payment_success": "🎓 Teacher Pro unlocked — 10 classes / 400 students per class.",
+      "teacher_payment_pending": "Teacher payment pending hai. Payment reconcile hote hi Teacher Pro sync ho jayega."
+    },
+    "learner_tracks": [
+      {
+        "id": "school",
+        "label": "School 6-12"
+      },
+      {
+        "id": "college",
+        "label": "College"
+      },
+      {
+        "id": "competitive",
+        "label": "Competitive"
+      },
+      {
+        "id": "phd",
+        "label": "PhD"
+      },
+      {
+        "id": "teacher",
+        "label": "Teacher"
+      }
+    ],
+    "parent_report": {
+      "title": "{brand} weekly report",
+      "weak_prefix": "Weak topics: ",
+      "details_link": "Detail: {public_domain}"
+    },
+    "discord_question_description": "Padhai ka sawaal",
+    "discord_unsupported_message": "SaarthiBhai study slash command is available here.",
+    "telegram_document": {
+      "enabled": true,
+      "max_bytes": 4194304,
+      "photo_or_pdf_hint": "File bhej de bhai — main padh ke solve/notes bana dunga."
+    },
+    "snapchat_streak": {
+      "reward_days": 7,
+      "reward_coins": 200,
+      "auto_reply_enabled": false
+    },
+    "queue_messages": {
+      "pro_priority": "Pro queue me priority hai.",
+      "free_wait": "Thoda load hai, saved answer/video path use kar raha hu."
+    },
+    "onboarding_parent_prompt": "Parents ka WhatsApp number de de, har Sunday report bhejunga. Skip karna ho to Cancel.",
+    "api_labels": {
+      "quick_actions_title": "👇 Agla step yahan se choose kar le:",
+      "question_photo_hint": "Photo se samjha — ye raha solution."
+    },
+    "telegram_document_hint": "PDF/document bhej de bhai — main padh ke solve, notes ya PYQ bana dunga."
   },
   "theme": {
     "primary": "#FFD600",
