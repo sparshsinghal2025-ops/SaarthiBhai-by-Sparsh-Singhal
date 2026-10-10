@@ -855,6 +855,8 @@ class Database:
             "learner_track": "school_college",
             "onboarding_gift_claimed": "1",
             "trial_granted": "0",
+            "trial_granted_at": "",
+            "trial_reason": "",
             "correct_answers": "0",
             "wrong_answers": "0",
             "last_question_at": "",
@@ -1040,42 +1042,60 @@ class Database:
         return rows[:limit]
 
     def apply_referral(self, new_uid: str | int, ref_code: str) -> bool:
-        """Reward both the new user and the referrer with bonus free questions / XP.
-        Zero-cost growth lever — no ads budget needed, existing users bring new ones."""
+        """Apply a referral exactly once, then let maybe_grant_trial() decide Pro eligibility."""
         if not self.redis or not ref_code:
             return False
         ref_code = ref_code.strip().upper()
         new_uid = str(new_uid)
         try:
-            lock_key = f"reflock:{new_uid}"
-            if not self.redis.set(lock_key, "1", nx=True, ex=86400):
-                return False  # already processed for this user
             referrer_uid = self.redis.get(f"refcode:{ref_code}")
-            if not referrer_uid or referrer_uid == new_uid:
+            if not referrer_uid or str(referrer_uid) == new_uid:
                 return False
+
             new_user = self.get_user(new_uid)
             if not new_user or new_user.get("referred_by"):
                 return False
-            new_user["referred_by"] = referrer_uid
-            self.save_user(new_uid, new_user)
-            # Bonus: +2 lifetime questions for the new user (soft, capped)
-            today = _today_ist()
-            self.redis.decrby(f"quota:lifetime:{new_uid}", 2)
-            # POINT 25 — both sides get coins for the referral.
-            self.add_coins(new_uid, config.REFERRAL_COINS)
-            self.add_coins(referrer_uid, config.REFERRAL_COINS)
-            ref_user = self.get_user(referrer_uid)
-            if ref_user:
-                count = int(ref_user.get("referral_count", 0) or 0) + 1
-                ref_user["referral_count"] = str(count)
-                self.save_user(referrer_uid, ref_user)
-                self.add_xp(referrer_uid, 50)
-                growth_cfg = config.CONTENT.get("pro_growth", {})
-                referral_threshold = max(1, int(growth_cfg.get("referral_threshold", 3) or 3))
-                referral_days = max(1, int(growth_cfg.get("referral_days", 3) or 3))
-                if count % referral_threshold == 0:
-                    self.activate_pro(referrer_uid, days=referral_days)
-            return True
+
+            # Short processing lock prevents concurrent duplicate rewards.
+            canonical_new = _canonical_uid(self, new_uid) if self.redis else new_uid
+            process_lock = f"referral:process:{canonical_new}"
+            if not self.redis.set(process_lock, "1", nx=True, ex=120):
+                return False
+
+            try:
+                # Re-check after acquiring the lock so a retry sees the latest state.
+                new_user = self.get_user(new_uid)
+                if not new_user or new_user.get("referred_by"):
+                    return False
+
+                new_user["referred_by"] = str(referrer_uid)
+                self.save_user(new_uid, new_user)
+
+                # Bonus: +2 lifetime questions for the new user (soft, capped).
+                self.redis.decrby(f"quota:lifetime:{new_uid}", 2)
+
+                # Both sides receive referral coins.
+                self.add_coins(new_uid, config.REFERRAL_COINS)
+                self.add_coins(referrer_uid, config.REFERRAL_COINS)
+
+                ref_user = self.get_user(referrer_uid)
+                if ref_user:
+                    count = int(ref_user.get("referral_count", 0) or 0) + 1
+                    ref_user["referral_count"] = str(count)
+                    self.save_user(referrer_uid, ref_user)
+                    self.add_xp(referrer_uid, 50)
+                    # IMPORTANT: referral processing never directly activates Pro.
+                    # The single authoritative trial evaluator below decides it.
+                    try:
+                        self.maybe_grant_trial(referrer_uid)
+                    except Exception:
+                        pass
+                return True
+            finally:
+                try:
+                    self.redis.delete(process_lock)
+                except Exception:
+                    pass
         except Exception as e:
             logger.warning("apply_referral: %s", e)
             return False
@@ -6868,6 +6888,8 @@ def _v7_sync(self, uid, user=None):
         } else "school_college")
         u.setdefault("onboarding_gift_claimed", "1")
         u.setdefault("trial_granted", "0")
+        u.setdefault("trial_granted_at", "")
+        u.setdefault("trial_reason", "")
         u.setdefault("telegram_chat_id", "")
         u.setdefault("instagram_user_id", "")
     ok = _ORIG_SYNC_SUPABASE(self, uid, u)
@@ -6878,6 +6900,8 @@ def _v7_sync(self, uid, user=None):
                 "learner_track": u.get("learner_track", "school_college"),
                 "onboarding_gift_claimed": str(u.get("onboarding_gift_claimed", "1")).lower() in ("1","true","yes"),
                 "trial_granted": str(u.get("trial_granted", "0")).lower() in ("1","true","yes"),
+                "trial_granted_at": u.get("trial_granted_at", "") or None,
+                "trial_reason": u.get("trial_reason", "") or None,
             "last_payment_id": u.get("last_payment_id", ""),
             "refunded_at": u.get("refunded_at", "") or None,
             "last_refund_id": u.get("last_refund_id", ""),
@@ -6944,23 +6968,45 @@ Database.update_streak = _v7_update_streak
 
 
 def _maybe_grant_trial(self, uid: str | int) -> bool:
+    """Single authoritative free-trial evaluator. Exactly one 3-day trial per user."""
     if not self.redis:
         return False
     try:
         u = self.get_user(uid) or {}
         if str(u.get("trial_granted", "0")).lower() in ("1", "true", "yes"):
             return False
+
         referrals = int(u.get("referral_count", 0) or 0)
         coins = int(u.get("coins", 0) or 0)
-        if coins < config.TRIAL_COINS and referrals < config.TRIAL_REFERRALS:
+        reason = ""
+        if coins >= config.TRIAL_COINS:
+            reason = "coins"
+        elif referrals >= config.TRIAL_REFERRALS:
+            reason = "referrals"
+        else:
             return False
-        if not self.redis.set(f"trial:claim:{_canonical_uid(self, uid)}", "1", nx=True, ex=86400 * 3650):
+
+        canonical = _canonical_uid(self, uid)
+        claim_key = f"trial:claim:{canonical}"
+        if not self.redis.set(claim_key, "1", nx=True, ex=86400 * 3650):
             return False
-        self.activate_pro(uid, days=config.TRIAL_DAYS)
+
+        # Activate exactly one trial. activate_pro extends an already-active plan,
+        # but this function can execute only once because of trial_granted + claim_key.
+        if not self.activate_pro(uid, days=config.TRIAL_DAYS):
+            try:
+                self.redis.delete(claim_key)
+            except Exception:
+                pass
+            return False
+
         u = self.get_user(uid) or {}
         u["trial_granted"] = "1"
+        u["trial_granted_at"] = _now_ist().isoformat()
+        u["trial_reason"] = reason
         self.save_user(uid, u)
         self.sync_user_to_supabase(uid, u)
+        logger.info("Free trial granted uid=%s reason=%s days=%s", uid, reason, config.TRIAL_DAYS)
         return True
     except Exception as e:
         logger.warning("trial grant: %s", e)
@@ -9156,6 +9202,13 @@ app.view_functions['cron_payment_reconcile']=cron_payment_reconcile_final
 
 # -- Sunday/3AM/feature endpoints and complete backup content are already present. --
 
+
+
+# v8.1 completeness upgrade: concrete tools, PPTX, current-affairs RSS,
+# originality checks, server-side voice transcription, 10-in-1 schema, queue
+# status and API health. MCP is hosted separately by asgi_app.py.
+from full_feature_upgrade import register_full_feature_upgrade as _register_full_feature_upgrade
+_register_full_feature_upgrade(globals())
 
 if __name__ == "__main__":
     # threaded=True lets Flask's dev server handle multiple concurrent
