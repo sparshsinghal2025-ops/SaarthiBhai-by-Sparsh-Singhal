@@ -65,7 +65,7 @@
   },
   "limits": {
     "free_daily_questions": 10,
-    "free_lifetime_questions": 12,
+    "free_lifetime_questions": 100,
     "pro_price_inr": 49,
     "xp_question": 15,
     "welcome_coins": 50,
@@ -525,8 +525,8 @@
     },
     "product_text": {
       "pro_upgrade": "Upgrade ₹{price}/30 days",
-      "pro_tool": "🔒 Pro-only tool.",
-      "free_limit": "❌ Free limit khatam",
+      "pro_tool": "🔒 Pro-only tool. Sirf PRO Plan Users Ke Liye.",
+      "free_limit": "Shit yaar. Tumhari Free Limit Khatam Ho Gayi❌",
       "ai_busy": "SaarthiBhai abhi thoda busy hai.",
       "pdf_title": "SaarthiBhai study sheet",
       "resource_video_fallback_title": "Relevant video",
@@ -539,7 +539,7 @@
       "voice_unavailable": "Is browser me voice input available nahi hai.",
       "voice_pro_only": "Voice sunna PRO feature hai.",
       "photo_no_answer": "Photo ka answer nahi aaya.",
-      "image_too_large": "Image too large. Please use a smaller image.",
+      "image_too_large": "Image bohot badi hai. Chhoti image use karo.",
       "ai_rate_limited": "Too many requests. Wait a minute."
     },
     "boards": [
