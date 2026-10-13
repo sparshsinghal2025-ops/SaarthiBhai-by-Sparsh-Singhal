@@ -32,7 +32,7 @@ OFFICIAL_SOURCE_DOMAINS = {
     "pib.gov.in",
     "education.gov.in",
 }
-PIB_RSS_URL = "https://pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=1"
+PIB_RSS_URL = "https://pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=1&reg=48"
 MAX_TEXT = 12000
 
 
