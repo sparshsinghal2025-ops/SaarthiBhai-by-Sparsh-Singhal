@@ -5357,11 +5357,15 @@ def serve_photo():
 
 @app.route("/")
 def home():
-    return render_template_string(FRONTEND_HTML, price=config.PRO_PRICE_INR, referral_coins=config.REFERRAL_COINS,
+    page = render_template_string(FRONTEND_HTML, price=config.PRO_PRICE_INR, referral_coins=config.REFERRAL_COINS,
                                    spin_min=config.SPIN_MIN_COINS, spin_max=config.SPIN_MAX_COINS,
                                    theme_primary=config.THEME["primary"], brand_name=config.BRAND_NAME, creator_name=config.CREATOR_NAME,
                                    katex_css=config.URLS["katex_css"], katex_js=config.URLS["katex_js"], katex_auto_render_js=config.URLS["katex_auto_render_js"],
                                    whatsapp_share_url=config.URLS["whatsapp_share_url"], youtube_example_url=config.CONTENT.get("youtube_example_url", ""))
+    study_link = '<a href="/study-intelligence" style="position:fixed;right:16px;bottom:16px;z-index:9999;background:#ffd600;color:#111;padding:12px 16px;border-radius:12px;font-weight:800;text-decoration:none;box-shadow:0 4px 16px #0005">📚 Study Intelligence</a>'
+    if "</body>" in page:
+        page = page.replace("</body>", study_link + "</body>", 1)
+    return page
 
 
 @app.route("/pay")
@@ -9209,6 +9213,40 @@ app.view_functions['cron_payment_reconcile']=cron_payment_reconcile_final
 # status and API health. MCP is hosted separately by asgi_app.py.
 from full_feature_upgrade import register_full_feature_upgrade as _register_full_feature_upgrade
 _register_full_feature_upgrade(globals())
+
+# Phase 2: durable study-intelligence index, reviewed sources, spaced flashcards,
+# revision planner, official-source current affairs, diagrams and internal-only copy check.
+from study_intelligence import register_study_intelligence as _register_study_intelligence
+
+def _study_intelligence_ai(prompt, tool, subject, language):
+    return get_ai_answer_v9(prompt, tool, False, language=language, phone_number="", exam_type="", subject=subject, uid="")
+
+def _study_intelligence_is_pro(student_key):
+    # The Phase 2 dashboard passes canonical client IDs. Do not treat a
+    # user-entered phone number as proof of entitlement; phone linking requires
+    # the application's authenticated identity flow.
+    return bool(student_key and db.is_pro(student_key))
+
+def _study_intelligence_consume_video_quota(student_key):
+    if _study_intelligence_is_pro(student_key):
+        return True
+    if not db.redis:
+        # Existing rate limit still applies if Redis is unavailable.
+        return True
+    try:
+        return bool(db.redis.set(f"resource:video-notes:{student_key}:{_today_ist()}", "1", nx=True, ex=90000))
+    except Exception:
+        return True
+
+_register_study_intelligence(
+    app=app,
+    supa=supa,
+    config=config,
+    ai_generator=_study_intelligence_ai,
+    rate_limited=is_rate_limited,
+    is_pro_user=_study_intelligence_is_pro,
+    consume_video_quota=_study_intelligence_consume_video_quota,
+)
 
 if __name__ == "__main__":
     # threaded=True lets Flask's dev server handle multiple concurrent
