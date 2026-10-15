@@ -1,0 +1,76 @@
+services:
+  - type: web
+    name: saarthibhai-web
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn asgi_app:app --host 0.0.0.0 --port $PORT --workers 1
+    autoDeploy: true
+    envVars:
+      - key: REDIS_URL
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: XAI_API_KEY
+        sync: false
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: PERPLEXITY_API_KEY
+        sync: false
+      - key: META_API_KEY
+        sync: false
+      - key: MISTRAL_API_KEY
+        sync: false
+      - key: QWEN_API_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: WHATSAPP_TOKEN
+        sync: false
+      - key: WHATSAPP_PHONE_NUMBER_ID
+        sync: false
+      - key: WHATSAPP_VERIFY_TOKEN
+        sync: false
+      - key: CRON_SECRET
+        sync: false
+      - key: DEV_SECRET
+        sync: false
+      - key: SAARTHIBHAI_API_KEY
+        sync: false
+      - key: DISCORD_ENABLED
+        sync: false
+      - key: DISCORD_RUN_MODE
+        sync: false
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: DISCORD_APPLICATION_ID
+        sync: false
+      - key: DISCORD_PUBLIC_KEY
+        sync: false
+      - key: DISCORD_GUILD_ID
+        sync: false
+      - key: DISCORD_MESSAGE_CONTENT_INTENT
+        sync: false
+      - key: REDDIT_ENABLED
+        sync: false
+      - key: REDDIT_BACKEND_TOKEN
+        sync: false
+      - key: MCP_API_KEY
+        sync: false
