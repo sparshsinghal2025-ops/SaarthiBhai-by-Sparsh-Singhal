@@ -4,7 +4,7 @@
     "creator_name": "Sparsh Singhal",
     "creator_photo_url": "/sparsh.jpg",
     "creator_story_url": "/about",
-    "version": "SaarthiBhai v8.0 – 12-Point Feature Pack",
+    "version": "SaarthiBhai v8.2 — Study Intelligence Phase 2",
     "timezone": "Asia/Kolkata",
     "date_format": "%Y-%m-%d",
     "port": 5000,
@@ -525,8 +525,8 @@
     },
     "product_text": {
       "pro_upgrade": "Upgrade ₹{price}/30 days",
-      "pro_tool": "🔒 Pro-only tool. Sirf PRO Plan Users Ke Liye.",
-      "free_limit": "Shit yaar. Tumhari Free Limit Khatam Ho Gayi❌",
+      "pro_tool": "🔒 Pro-only tool.",
+      "free_limit": "❌ Free limit khatam",
       "ai_busy": "SaarthiBhai abhi thoda busy hai.",
       "pdf_title": "SaarthiBhai study sheet",
       "resource_video_fallback_title": "Relevant video",
@@ -539,7 +539,7 @@
       "voice_unavailable": "Is browser me voice input available nahi hai.",
       "voice_pro_only": "Voice sunna PRO feature hai.",
       "photo_no_answer": "Photo ka answer nahi aaya.",
-      "image_too_large": "Image bohot badi hai. Chhoti image use karo.",
+      "image_too_large": "Image too large. Please use a smaller image.",
       "ai_rate_limited": "Too many requests. Wait a minute."
     },
     "boards": [
@@ -1158,7 +1158,7 @@
       "quick_actions_title": "👇 Agla step yahan se choose kar le:",
       "question_photo_hint": "Photo se samjha — ye raha solution."
     },
-    "telegram_document_hint": "PDF/document bhej de bhai — main padh ke solve, notes ya PYQ bana dunga.",
+    "telegram_document_hint": "Send one clear photo of a single question or paste the short question text. Full PDFs/books/papers are not accepted as uploads.",
     "upgrade_completeness": {
       "notes": {
         "short_words": 450,
@@ -1179,8 +1179,7 @@
       },
       "current_affairs": {
         "rss_feeds": [
-          "https://feeds.bbci.co.uk/news/world/rss.xml",
-          "https://feeds.bbci.co.uk/news/technology/rss.xml"
+          "https://pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=1"
         ],
         "default_limit": 8
       },
@@ -1209,6 +1208,49 @@
       "external": {
         "mcp_path": "/mcp",
         "openapi_path": "/openapi.yaml"
+      },
+      "official_sources": [
+        {
+          "kind": "pyq",
+          "title": "CBSE Previous Years' Question Papers",
+          "url": "https://www.cbse.gov.in/cbsenew/question-paper.html",
+          "institution": "CBSE",
+          "note": "Official archive index. Choose year, class and subject on CBSE's site; SaarthiBhai does not host paper files."
+        },
+        {
+          "kind": "pyq",
+          "title": "CBSE Sample Question Papers and Marking Schemes",
+          "url": "https://www.cbse.gov.in/cbsenew/samplepaper.html",
+          "institution": "CBSE",
+          "note": "Official sample-paper index; generated SaarthiBhai questions remain AI practice unless an exact official item is linked."
+        },
+        {
+          "kind": "ncert",
+          "title": "NCERT Textbooks (Classes I–XII)",
+          "url": "https://ncert.nic.in/textbook.php",
+          "institution": "NCERT",
+          "note": "Official textbook index. Link out to NCERT; do not republish or host textbook PDFs/pages."
+        },
+        {
+          "kind": "ncert",
+          "title": "ePathshala Textbooks",
+          "url": "https://epathshala.nic.in/wp-content/doc/book/btextbook/textbook.htm",
+          "institution": "NCERT / ePathshala",
+          "note": "Official textbook portal; SaarthiBhai generates its own explanation."
+        },
+        {
+          "kind": "current_affairs",
+          "title": "PIB Press Releases RSS",
+          "url": "https://pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=1",
+          "institution": "Press Information Bureau, Government of India",
+          "note": "Official press-release feed; AI summaries are not official statements."
+        }
+      ],
+      "crawler": {
+        "sitemaps": [],
+        "max_urls_per_run": 20,
+        "max_html_bytes": 160000,
+        "policy": "Metadata only (title + URL); do not crawl PDFs or store textbook/paper bodies. Populate sitemaps only with manually verified official sitemap URLs."
       }
     }
   },
