@@ -3616,12 +3616,10 @@ footer.brand-footer strong{color:var(--accent)}
           <button type="button" id="mediaBtn" onclick="toggleMediaMenu(event)">📎 Media ▾</button>
           <div id="mediaMenu" style="display:none;position:absolute;bottom:110%;left:0;background:#111827;border:1px solid rgba(255,255,255,.12);border-radius:10px;min-width:180px;z-index:50;box-shadow:0 8px 24px rgba(0,0,0,.4)">
             <button type="button" class="media-item" onclick="pickMedia('image')" style="display:block;width:100%;text-align:left;padding:.65rem .9rem;background:transparent;border:none;color:#e2e8f0;cursor:pointer">🖼️ Images</button>
-            <button type="button" class="media-item" onclick="pickMedia('pdf')" style="display:block;width:100%;text-align:left;padding:.65rem .9rem;background:transparent;border:none;color:#e2e8f0;cursor:pointer">📄 PDFs <span style="color:#a78bfa;font-size:.75rem">PRO</span></button>
             <button type="button" class="media-item" onclick="pickMedia('youtube')" style="display:block;width:100%;text-align:left;padding:.65rem .9rem;background:transparent;border:none;color:#e2e8f0;cursor:pointer">▶️ YouTube Videos <span style="color:#a78bfa;font-size:.75rem">PRO</span></button>
           </div>
         </div>
         <input type="file" id="imageInput" accept="image/*" style="display:none" onchange="handleMediaFile(this,'image')">
-        <input type="file" id="pdfInput" accept="application/pdf,.pdf" style="display:none" onchange="handleMediaFile(this,'pdf')">
       </div>
       <div class="input-row">
         <textarea id="question" placeholder="Dimaag mein kya ghoom raha hai? Poocho... 🔥" rows="1"></textarea>
@@ -3939,11 +3937,14 @@ function closeProOnlyModal(){
 function pickMedia(kind){
   const m = document.getElementById("mediaMenu");
   if(m) m.style.display = "none";
-  if(kind === "pdf" || kind === "youtube"){
-    if(!isProUser){
-      showProOnlyModal();
-      return;
-    }
+  if(kind === "pdf"){
+    addMessage("bot", "📄 Full PDF uploads are not accepted for question intake. Paste one short question or upload one clear question photo. Textbook/PYQ files stay on their official source sites.");
+    mediaKind = null; window._mediaKind = null; imageBase64 = null;
+    return;
+  }
+  if(kind === "youtube" && !isProUser){
+    showProOnlyModal();
+    return;
   }
   mediaKind = kind;
   if(kind === "image"){
@@ -5357,15 +5358,11 @@ def serve_photo():
 
 @app.route("/")
 def home():
-    page = render_template_string(FRONTEND_HTML, price=config.PRO_PRICE_INR, referral_coins=config.REFERRAL_COINS,
+    return render_template_string(FRONTEND_HTML, price=config.PRO_PRICE_INR, referral_coins=config.REFERRAL_COINS,
                                    spin_min=config.SPIN_MIN_COINS, spin_max=config.SPIN_MAX_COINS,
                                    theme_primary=config.THEME["primary"], brand_name=config.BRAND_NAME, creator_name=config.CREATOR_NAME,
                                    katex_css=config.URLS["katex_css"], katex_js=config.URLS["katex_js"], katex_auto_render_js=config.URLS["katex_auto_render_js"],
                                    whatsapp_share_url=config.URLS["whatsapp_share_url"], youtube_example_url=config.CONTENT.get("youtube_example_url", ""))
-    study_link = '<a href="/study-intelligence" style="position:fixed;right:16px;bottom:16px;z-index:9999;background:#ffd600;color:#111;padding:12px 16px;border-radius:12px;font-weight:800;text-decoration:none;box-shadow:0 4px 16px #0005">📚 Study Intelligence</a>'
-    if "</body>" in page:
-        page = page.replace("</body>", study_link + "</body>", 1)
-    return page
 
 
 @app.route("/pay")
@@ -5726,7 +5723,9 @@ def web_ask():
     db.track_activity(uid)
     is_pro = db.is_pro(uid)
     media_kind = (data.get("media_kind") or ("image" if image_b64 else "")).strip().lower()
-    # Images: allowed for free users. PDF / YouTube media: Pro-only.
+    if media_kind == "pdf":
+        return jsonify({"answer": "📄 Full PDF uploads are not accepted for question intake. Paste one short question or upload one clear question photo. Official NCERT/PYQ files open on their source sites; SaarthiBhai does not host them.", "upload_rejected": True, "soft_failure": True}), 415
+    # Images: allowed for free users. YouTube media is Pro-only; full PDFs are blocked for everyone.
     if tool in PRO_ONLY_TOOLS and not is_pro:
         return jsonify({"answer": f"{config.PRODUCT_TEXT["pro_tool"]}\n\n{config.PRODUCT_TEXT["pro_upgrade"].format(price=config.PRO_PRICE_INR)}"})
     if image_b64 and media_kind in ("pdf", "youtube") and not is_pro:
@@ -5735,6 +5734,23 @@ def web_ask():
         can, quota = db.try_consume_quota(uid)
         if not can:
             return jsonify({"answer": "❌ Free limit khatam\n\nDoubt yahin ruk gaya. Kal tak wait — chahe raat ko exam ho.\n\nPro = ₹%s / 30 din (din ka ~₹1.6)\nUnlimited + photo se sawaal + mock/PYQ\n\nLimit pe mat atakna.\n\n- SaarthiBhai by Sparsh Singhal" % config.PRO_PRICE_INR, "quota": quota, "upsell": True})
+    study_annotation = ""
+    try:
+        source_catalog = globals().get("_study_intelligence_source_catalog")
+        if callable(source_catalog) and tool in {"pyq", "mock", "important", "ncert", "ncert_solutions"}:
+            source_kind = "ncert" if tool in {"ncert", "ncert_solutions"} else "pyq"
+            sources = source_catalog(kind=source_kind, query="", limit=5) or []
+            official_source = next((x for x in sources if x.get("label") == "Verified Official" and x.get("url")), None)
+            if source_kind == "ncert":
+                study_annotation = "📘 **AI-generated NCERT-aligned explanation** — original wording, not a verbatim textbook excerpt."
+            else:
+                study_annotation = "📌 **AI Pattern / Practice** — these generated questions are not verified historical PYQs and are not predictions."
+            if official_source:
+                safe_title = str(official_source.get("title") or "Official source").replace("]", "")
+                study_annotation += f"\n\n🔗 **Verified Official source link:** [{safe_title}]({official_source['url']})"
+    except Exception:
+        study_annotation = "📌 **AI Pattern / Practice** — generated questions are not verified historical PYQs." if tool in {"pyq", "mock", "important"} else ""
+
     start = time.time()
     cached = False
     answer = None
@@ -5768,6 +5784,8 @@ def web_ask():
     if (not answer) or str(answer).startswith("ERROR:") or soft:
         logger.warning("AI failure for uid=%s tool=%s reason=%s", uid, tool, (answer or "")[:120])
         fallback = _fallback_youtube_answer(q, is_pro, db.get_language(uid))
+        if study_annotation:
+            fallback = fallback.rstrip() + "\n\n" + study_annotation
         return jsonify({
             "answer": fallback,
             "resources": _10in1_metadata(q, is_pro, uid),
@@ -5775,6 +5793,8 @@ def web_ask():
             "fallback": True,
             "brand": BRAND_NAME,
         })
+    if study_annotation:
+        answer = str(answer or "").rstrip() + "\n\n" + study_annotation
     if not is_pro:
         pass  # already consumed atomically above via try_consume_quota
     udata = db.get_user(uid) or udata
@@ -8990,6 +9010,11 @@ async def handle_document_v9(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user=update.effective_user
     if not user or not update.message or not update.message.document: return
     doc=update.message.document; uid=user.id; db.track_activity(uid); is_pro=db.is_pro(uid)
+    document_mime=str(getattr(doc,'mime_type','') or '').lower()
+    document_name=str(getattr(doc,'file_name','') or '').lower()
+    if document_mime == 'application/pdf' or document_name.endswith('.pdf') or not document_mime.startswith('image/'):
+        await reply(update,"📄 Full PDF/document uploads are not accepted for question intake. Send one short question as text or one clear photo of a single question. Official NCERT/PYQ files must stay on their source sites.")
+        return
     if not is_pro:
         can,quota=db.try_consume_quota(uid)
         if not can:
@@ -9000,7 +9025,7 @@ async def handle_document_v9(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         file=await context.bot.get_file(doc.file_id)
         blob=bytes(await file.download_as_bytearray())
-        mime=str(getattr(doc,'mime_type','') or 'application/pdf')
+        mime=document_mime
         caption=(update.message.caption or '').strip()
         answer=run_ai(ai.answer_with_image,blob,mime,caption,'ocr' if 'image' not in mime else 'ocr',is_pro)
         if not answer or str(answer).startswith('ERROR:') or answer==SOFT_FAIL_MSG:
@@ -9076,6 +9101,8 @@ def _whatsapp_webhook_final():
                     elif mtype=='interactive':
                         inter=msg.get('interactive') or {}; bid=((inter.get('list_reply') or {}).get('id') or (inter.get('button_reply') or {}).get('id') or '')
                         if bid: _process_whatsapp_button(sender,bid,profile)
+                    elif mtype=='document':
+                        _ORIG_WA_SEND_TEXT(sender, '📄 Full PDF/document uploads are not accepted for question intake. Paste one short question or send one clear photo of a single question. Official NCERT/PYQ files stay on their source sites.')
                     elif mtype=='image':
                         user=db.ensure_user(f'wa:{sender}',full_name=profile or config.DEFAULT_STUDENT_NAMES['generic'],platform='whatsapp',phone_number=sender)
                         is_pro=db.is_pro(f'wa:{sender}')
@@ -9213,40 +9240,6 @@ app.view_functions['cron_payment_reconcile']=cron_payment_reconcile_final
 # status and API health. MCP is hosted separately by asgi_app.py.
 from full_feature_upgrade import register_full_feature_upgrade as _register_full_feature_upgrade
 _register_full_feature_upgrade(globals())
-
-# Phase 2: durable study-intelligence index, reviewed sources, spaced flashcards,
-# revision planner, official-source current affairs, diagrams and internal-only copy check.
-from study_intelligence import register_study_intelligence as _register_study_intelligence
-
-def _study_intelligence_ai(prompt, tool, subject, language):
-    return get_ai_answer_v9(prompt, tool, False, language=language, phone_number="", exam_type="", subject=subject, uid="")
-
-def _study_intelligence_is_pro(student_key):
-    # The Phase 2 dashboard passes canonical client IDs. Do not treat a
-    # user-entered phone number as proof of entitlement; phone linking requires
-    # the application's authenticated identity flow.
-    return bool(student_key and db.is_pro(student_key))
-
-def _study_intelligence_consume_video_quota(student_key):
-    if _study_intelligence_is_pro(student_key):
-        return True
-    if not db.redis:
-        # Existing rate limit still applies if Redis is unavailable.
-        return True
-    try:
-        return bool(db.redis.set(f"resource:video-notes:{student_key}:{_today_ist()}", "1", nx=True, ex=90000))
-    except Exception:
-        return True
-
-_register_study_intelligence(
-    app=app,
-    supa=supa,
-    config=config,
-    ai_generator=_study_intelligence_ai,
-    rate_limited=is_rate_limited,
-    is_pro_user=_study_intelligence_is_pro,
-    consume_video_quota=_study_intelligence_consume_video_quota,
-)
 
 if __name__ == "__main__":
     # threaded=True lets Flask's dev server handle multiple concurrent
